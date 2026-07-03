@@ -115,6 +115,7 @@ Claude utilizzerà automaticamente gli strumenti del server MCP per interrogare 
 - L'endpoint di produzione è `https://api.normattiva.it`
 - Il server usa il trasporto `stdio` (standard per MCP con Claude Desktop)
 - I log vengono scritti su `stderr` (non interferiscono con il protocollo MCP)
+- `dettaglio_atto` gestisce anche i **testi unici e i codici approvati con decreto** (es. codice penale, R.D. 639/1910): i loro articoli sono nell'allegato dell'atto e vengono recuperati automaticamente. Fa eccezione il corpo del **codice civile**, che Normattiva non espone come articoli tramite queste API Open Data.
 
 ## Licenza
 

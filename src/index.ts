@@ -190,29 +190,96 @@ type ArticoloResult =
   | { kind: "error"; status: number };
 
 /**
- * Recupera un singolo articolo (o l'intestazione) dell'atto tramite l'endpoint
- * POST /atto/dettaglio-atto. `idArticolo` corrisponde al numero dell'articolo.
+ * Estrae etichetta e testo di un articolo dall'HTML restituito dall'API.
+ * Gestisce sia gli articoli "articolati" (classe AKN "article-num-akn") sia
+ * quelli contenuti negli allegati/testi unici (classe "attachment-just-text",
+ * dove il numero d'articolo è testo semplice, es. "Art. 3.").
+ */
+function extractArticolo(html: string, idArticolo?: number): { label: string; testo: string } | null {
+  const hasAkn = html.includes("article-num-akn");
+  const hasAtt = html.includes("attachment-just-text");
+  if (!hasAkn && !hasAtt) return null;
+
+  if (hasAkn) {
+    const m = html.match(/article-num-akn[^>]*>([^<]+)</);
+    const label = m ? m[1].trim() : (idArticolo != null ? `Art. ${idArticolo}` : "");
+    // L'intestazione "Art. N" è già mostrata come label: rimuovila dal corpo.
+    const bodyHtml = html.replace(/<h2[^>]*article-num-akn[^>]*>[\s\S]*?<\/h2>/gi, "");
+    return { label, testo: htmlToText(bodyHtml) };
+  }
+
+  // Allegato / testo unico: il numero d'articolo è testo semplice.
+  let testo = htmlToText(html);
+  const m = testo.match(/Art(?:icolo)?\.?\s*\d+[\-A-Za-z]*/);
+  const label = m ? m[0].replace(/\s+/g, " ").trim() : (idArticolo != null ? `Art. ${idArticolo}` : "Allegato");
+  // Rimuovi il numero d'articolo se è a inizio testo (evita il doppione con la label).
+  testo = testo.replace(new RegExp("^" + label.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") + "\\.?\\s*"), "").trim();
+  return { label, testo };
+}
+
+/**
+ * Recupera un singolo articolo dell'atto tramite POST /atto/dettaglio-atto.
+ * `idArticolo` = numero dell'articolo; `flag` = flagTipoArticolo
+ * (0 = parte articolata, 1 = allegato / testo unico).
  */
 async function fetchDettaglioArticolo(
   baseBody: Record<string, unknown>,
   idArticolo?: number,
+  flag?: number,
 ): Promise<{ res: ArticoloResult; atto: any }> {
-  const body = idArticolo != null ? { ...baseBody, idArticolo } : { ...baseBody };
+  const body: Record<string, unknown> = { ...baseBody };
+  if (idArticolo != null) body.idArticolo = idArticolo;
+  if (flag != null) body.flagTipoArticolo = flag;
   const { status, data } = await apiPostStatus("/atto/dettaglio-atto", body);
   if (status === 404) return { res: { kind: "notfound" }, atto: null };
   if (status !== 200 || !data) return { res: { kind: "error", status }, atto: null };
 
   const atto = data?.data?.atto ?? null;
-  const html: string = atto?.articoloHtml ?? "";
-  // Un articolo con testo reale contiene l'intestazione AKN "article-num-akn".
-  if (html.includes("article-num-akn")) {
-    const m = html.match(/article-num-akn[^>]*>([^<]+)</);
-    const label = m ? m[1].trim() : (idArticolo != null ? `Art. ${idArticolo}` : "");
-    // Rimuovi l'intestazione "Art. N" dal corpo: è già mostrata come label in grassetto.
-    const bodyHtml = html.replace(/<h2[^>]*article-num-akn[^>]*>[\s\S]*?<\/h2>/gi, "");
-    return { res: { kind: "article", label, testo: htmlToText(bodyHtml) }, atto };
-  }
+  const ex = extractArticolo(atto?.articoloHtml ?? "", idArticolo);
+  if (ex) return { res: { kind: "article", label: ex.label, testo: ex.testo }, atto };
   return { res: { kind: "empty" }, atto };
+}
+
+/**
+ * Recupera un articolo provando prima la parte articolata (flag 0) e, se assente,
+ * l'allegato / testo unico (flag 1). Necessario per i decreti che "approvano un
+ * testo unico" (molti R.D. e i codici), dove gli articoli stanno nell'allegato.
+ */
+async function fetchArticoloAuto(
+  baseBody: Record<string, unknown>,
+  idArticolo: number,
+): Promise<{ res: ArticoloResult; atto: any; fromAllegato: boolean }> {
+  const r0 = await fetchDettaglioArticolo(baseBody, idArticolo, 0);
+  if (r0.res.kind !== "notfound") return { ...r0, fromAllegato: false };
+  const r1 = await fetchDettaglioArticolo(baseBody, idArticolo, 1);
+  if (r1.res.kind === "article") return { ...r1, fromAllegato: true };
+  return { ...r0, fromAllegato: false };
+}
+
+/**
+ * Scorre gli articoli (1..cap) di una sezione dell'atto (flag) in piccoli batch,
+ * fermandosi al primo articolo assente (404).
+ */
+async function walkArticoli(
+  baseBody: Record<string, unknown>,
+  flag: number,
+  cap: number,
+): Promise<{ articoli: Array<{ label: string; testo: string }>; ended: boolean; atto: any }> {
+  const BATCH = 6;
+  const articoli: Array<{ label: string; testo: string }> = [];
+  let ended = false;
+  let atto: any = null;
+  for (let start = 1; start <= cap && !ended; start += BATCH) {
+    const nums: number[] = [];
+    for (let k = start; k < start + BATCH && k <= cap; k++) nums.push(k);
+    const results = await Promise.all(nums.map((n) => fetchDettaglioArticolo(baseBody, n, flag)));
+    for (const r of results) {
+      if (r.atto && !atto) atto = r.atto;
+      if (r.res.kind !== "article") { ended = true; break; }
+      articoli.push({ label: r.res.label, testo: r.res.testo });
+    }
+  }
+  return { articoli, ended, atto };
 }
 
 /**
@@ -396,7 +463,7 @@ server.tool(
 // --------------------------------------------------------------------------
 server.tool(
   "dettaglio_atto",
-  `Recupera il testo di un atto normativo dalla banca dati Normattiva. Richiede il codice redazionale E la data di pubblicazione in Gazzetta Ufficiale (data_gu, formato YYYY-MM-DD): entrambi si ottengono dai risultati di ricerca_semplice, ricerca_avanzata o trova_atto_specifico. Senza il parametro 'articolo' restituisce l'intestazione e l'art. 1; usa 'articolo' per un articolo specifico (es. articolo=192), oppure 'testo_completo'=true per l'intero testo dell'atto.`,
+  `Recupera il testo di un atto normativo dalla banca dati Normattiva. Richiede il codice redazionale E la data di pubblicazione in Gazzetta Ufficiale (data_gu, formato YYYY-MM-DD): entrambi si ottengono dai risultati di ricerca_semplice, ricerca_avanzata o trova_atto_specifico. Senza il parametro 'articolo' restituisce l'intestazione e l'art. 1; usa 'articolo' per un articolo specifico (es. articolo=192), oppure 'testo_completo'=true per l'intero testo dell'atto. Gestisce anche i testi unici e i codici approvati con decreto (es. codice penale, R.D. 639/1910), i cui articoli sono contenuti nell'allegato.`,
   {
     codice_redazionale: z.string().describe("Codice redazionale dell'atto (es. '006G0171', '26G00130'). Si ottiene dai risultati della ricerca."),
     data_gu: z.string().describe("Data di pubblicazione in Gazzetta Ufficiale, formato YYYY-MM-DD (campo 'dataGU' dei risultati della ricerca, es. '2006-04-14'). Obbligatoria."),
@@ -405,84 +472,101 @@ server.tool(
     testo_completo: z.boolean().default(false).describe("Se true, recupera tutti gli articoli dell'atto (fino a un massimo di 40). Ignorato se è specificato 'articolo'."),
   },
   async ({ codice_redazionale, data_gu, articolo, data_vigenza, testo_completo }) => {
+    const out = (t: string) => ({ content: [{ type: "text" as const, text: t }] });
+    const bad = (t: string) => ({ content: [{ type: "text" as const, text: t }], isError: true });
     try {
       const baseBody: Record<string, unknown> = {
         dataGU: data_gu,
         codiceRedazionale: codice_redazionale,
       };
       if (data_vigenza) baseBody.dataVigenza = data_vigenza;
-
-      // --- Caso 1: articolo specifico ---
-      if (articolo != null) {
-        const { res, atto } = await fetchDettaglioArticolo(baseBody, articolo);
-        if (res.kind === "notfound") {
-          return {
-            content: [{ type: "text", text: `Articolo ${articolo} non trovato per l'atto ${codice_redazionale} (dataGU ${data_gu}). L'atto potrebbe avere meno articoli, oppure codice_redazionale/data_gu non sono corretti (verifica con una ricerca).` }],
-            isError: true,
-          };
-        }
-        if (res.kind === "error") {
-          return { content: [{ type: "text", text: `Errore nel recupero dell'articolo ${articolo} (HTTP ${res.status}).` }], isError: true };
-        }
-        const intest = formatIntestazioneAtto(atto, codice_redazionale, data_gu, data_vigenza);
-        if (res.kind === "empty") {
-          return { content: [{ type: "text", text: `${intest}\n\nIl testo dell'articolo ${articolo} non è disponibile (atto molto recente o articolo privo di testo consolidato).` }] };
-        }
-        return { content: [{ type: "text", text: `${intest}\n\n---\n**${res.label}**\n${res.testo}` }] };
-      }
-
-      // --- Caso 2/3: intero atto o intestazione + art. 1 ---
-      const first = await fetchDettaglioArticolo(baseBody, 1);
-      if (first.res.kind === "notfound") {
-        // Prova senza idArticolo: se l'atto esiste, mostra almeno l'intestazione
-        const bare = await fetchDettaglioArticolo(baseBody, undefined);
-        if (bare.atto) {
-          return { content: [{ type: "text", text: `${formatIntestazioneAtto(bare.atto, codice_redazionale, data_gu, data_vigenza)}\n\n(Nessun testo di articolo disponibile per questo atto.)` }] };
-        }
-        return {
-          content: [{ type: "text", text: `Atto non trovato. Verifica codice_redazionale ("${codice_redazionale}") e data_gu ("${data_gu}"): entrambi vanno presi dai risultati di ricerca_semplice/avanzata o trova_atto_specifico.` }],
-          isError: true,
-        };
-      }
-      if (first.res.kind === "error") {
-        return { content: [{ type: "text", text: `Errore nel recupero dell'atto (HTTP ${first.res.status}).` }], isError: true };
-      }
-
-      const intest = formatIntestazioneAtto(first.atto, codice_redazionale, data_gu, data_vigenza);
-      if (first.res.kind === "empty") {
-        return { content: [{ type: "text", text: `${intest}\n\nIl testo consolidato degli articoli non è ancora disponibile per questo atto (probabilmente molto recente). È consultabile nella Gazzetta Ufficiale indicata.` }] };
-      }
-
-      // Abbiamo il testo dell'art. 1
-      if (!testo_completo) {
-        return {
-          content: [{ type: "text", text: `${intest}\n\n---\n**${first.res.label}**\n${first.res.testo}\n\n---\n*L'atto contiene più articoli. Usa \`articolo=N\` per un articolo specifico (es. \`articolo=2\`), oppure \`testo_completo=true\` per l'intero testo.*` }],
-        };
-      }
-
-      // --- Testo completo: scorre gli articoli in piccoli batch fino alla fine (404) ---
       const CAP = 40;
-      const BATCH = 6;
-      const parts: string[] = [`**${first.res.label}**\n${first.res.testo}`];
-      let ended = false;
-      for (let start = 2; start <= CAP && !ended; start += BATCH) {
-        const nums: number[] = [];
-        for (let k = start; k < start + BATCH && k <= CAP; k++) nums.push(k);
-        const results = await Promise.all(nums.map((n) => fetchDettaglioArticolo(baseBody, n)));
-        for (let i = 0; i < results.length; i++) {
-          const r = results[i].res;
-          if (r.kind !== "article") { ended = true; break; }
-          parts.push(`**${r.label}**\n${r.testo}`);
+
+      // === Caso 1: articolo specifico (con fallback all'allegato/testo unico) ===
+      if (articolo != null) {
+        const r = await fetchArticoloAuto(baseBody, articolo);
+        if (r.res.kind === "notfound") {
+          return bad(`Articolo ${articolo} non trovato per l'atto ${codice_redazionale} (dataGU ${data_gu}). L'atto potrebbe avere meno articoli, oppure codice_redazionale/data_gu non sono corretti (verifica con una ricerca).`);
         }
+        if (r.res.kind === "error") {
+          return bad(`Errore nel recupero dell'articolo ${articolo} (HTTP ${r.res.status}).`);
+        }
+        const intest = formatIntestazioneAtto(r.atto, codice_redazionale, data_gu, data_vigenza);
+        if (r.res.kind === "empty") {
+          return out(`${intest}\n\nIl testo dell'articolo ${articolo} non è disponibile (atto molto recente o articolo privo di testo consolidato).`);
+        }
+        const nota = r.fromAllegato ? " *(dal testo unico allegato)*" : "";
+        return out(`${intest}\n\n---\n**${r.res.label}**${nota}\n${r.res.testo}`);
       }
-      let out = `${intest}\n\n${parts.join("\n\n---\n")}`;
-      if (!ended) out += `\n\n---\n*Testo troncato ai primi ${CAP} articoli. Usa \`articolo=N\` per consultare gli articoli successivi.*`;
-      return { content: [{ type: "text", text: out }] };
+
+      // === Caso 2: testo completo ===
+      if (testo_completo) {
+        const main = await walkArticoli(baseBody, 0, CAP);
+        if (main.articoli.length >= 2) {
+          const intest = formatIntestazioneAtto(main.atto, codice_redazionale, data_gu, data_vigenza);
+          const parts = main.articoli.map((a) => `**${a.label}**\n${a.testo}`);
+          let o = `${intest}\n\n${parts.join("\n\n---\n")}`;
+          if (!main.ended) o += `\n\n---\n*Testo troncato ai primi ${CAP} articoli. Usa \`articolo=N\` per consultare gli articoli successivi.*`;
+          return out(o);
+        }
+        // ≤1 articolo nella parte articolata: il contenuto vero potrebbe essere l'allegato/testo unico
+        const alleg = await walkArticoli(baseBody, 1, CAP);
+        const atto = alleg.atto || main.atto;
+        if (alleg.articoli.length >= 1) {
+          const intest = formatIntestazioneAtto(atto, codice_redazionale, data_gu, data_vigenza);
+          const parts = alleg.articoli.map((a) => `**${a.label}**\n${a.testo}`);
+          let o = `${intest}\n\n*Testo unico allegato:*\n\n${parts.join("\n\n---\n")}`;
+          if (!alleg.ended) o += `\n\n---\n*Testo troncato ai primi ${CAP} articoli. Usa \`articolo=N\` per gli articoli successivi.*`;
+          return out(o);
+        }
+        if (main.articoli.length === 1) {
+          const intest = formatIntestazioneAtto(main.atto, codice_redazionale, data_gu, data_vigenza);
+          return out(`${intest}\n\n---\n**${main.articoli[0].label}**\n${main.articoli[0].testo}`);
+        }
+        if (atto) {
+          return out(`${formatIntestazioneAtto(atto, codice_redazionale, data_gu, data_vigenza)}\n\nIl testo consolidato degli articoli non è ancora disponibile per questo atto.`);
+        }
+        return bad(`Atto non trovato. Verifica codice_redazionale ("${codice_redazionale}") e data_gu ("${data_gu}"): entrambi vanno presi dai risultati di ricerca_semplice/avanzata o trova_atto_specifico.`);
+      }
+
+      // === Caso 3: default — intestazione + art. 1 (con rilevamento testo unico) ===
+      const a1 = await fetchDettaglioArticolo(baseBody, 1, 0);
+      if (a1.res.kind === "error") {
+        return bad(`Errore nel recupero dell'atto (HTTP ${a1.res.status}).`);
+      }
+      if (a1.res.kind === "empty") {
+        return out(`${formatIntestazioneAtto(a1.atto, codice_redazionale, data_gu, data_vigenza)}\n\nIl testo consolidato degli articoli non è ancora disponibile per questo atto (probabilmente molto recente). È consultabile nella Gazzetta Ufficiale indicata.`);
+      }
+
+      // Se l'art. 1 è un "Articolo Unico" (o manca del tutto), il contenuto potrebbe essere nell'allegato.
+      let soloArticoloUnico = false;
+      if (a1.res.kind === "article") {
+        const a2 = await fetchDettaglioArticolo(baseBody, 2, 0);
+        soloArticoloUnico = a2.res.kind === "notfound";
+      }
+      if (a1.res.kind === "notfound" || soloArticoloUnico) {
+        const alleg1 = await fetchDettaglioArticolo(baseBody, 1, 1);
+        if (alleg1.res.kind === "article") {
+          const intest = formatIntestazioneAtto(alleg1.atto || a1.atto, codice_redazionale, data_gu, data_vigenza);
+          return out(`${intest}\n\n*Atto che approva un testo unico: gli articoli sostanziali sono nell'allegato.*\n\n---\n**${alleg1.res.label}**\n${alleg1.res.testo}\n\n---\n*Usa \`articolo=N\` per un articolo (es. \`articolo=3\`), oppure \`testo_completo=true\` per l'intero testo.*`);
+        }
+        if (a1.res.kind === "notfound") {
+          const bare = await fetchDettaglioArticolo(baseBody, undefined, 0);
+          if (bare.atto) {
+            return out(`${formatIntestazioneAtto(bare.atto, codice_redazionale, data_gu, data_vigenza)}\n\n(Nessun testo di articolo disponibile per questo atto.)`);
+          }
+          return bad(`Atto non trovato. Verifica codice_redazionale ("${codice_redazionale}") e data_gu ("${data_gu}"): entrambi vanno presi dai risultati di ricerca_semplice/avanzata o trova_atto_specifico.`);
+        }
+        // soloArticoloUnico ma senza allegato: prosegue mostrando l'Articolo Unico.
+      }
+
+      // Atto normale (o Articolo Unico senza allegato): intestazione + art. 1
+      const a1art = a1.res.kind === "article" ? a1.res : null;
+      if (!a1art) return bad("Errore nel recupero dell'atto.");
+      const intest = formatIntestazioneAtto(a1.atto, codice_redazionale, data_gu, data_vigenza);
+      return out(`${intest}\n\n---\n**${a1art.label}**\n${a1art.testo}\n\n---\n*L'atto contiene più articoli. Usa \`articolo=N\` per un articolo specifico (es. \`articolo=2\`), oppure \`testo_completo=true\` per l'intero testo.*`);
     } catch (error) {
-      return {
-        content: [{ type: "text", text: `Errore nel recupero del dettaglio: ${error instanceof Error ? error.message : String(error)}` }],
-        isError: true,
-      };
+      return bad(`Errore nel recupero del dettaglio: ${error instanceof Error ? error.message : String(error)}`);
     }
   }
 );
