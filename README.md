@@ -6,10 +6,11 @@ Questo server permette a **Claude** (via Claude Desktop, Cowork, o Claude Code) 
 
 ## Cosa può fare
 
+- **Dettaglio atto**: recupera il testo di un atto (un singolo articolo, anche `-bis`/`-ter`/…, o l'intero testo), identificandolo per **nome comune** (es. `nome_codice="codice civile"`), per tipo+numero+anno (es. "R.D. 639/1910") oppure per codice redazionale
+- **Corpi normativi**: elenco cablato e verificato di **~55 codici, testi unici e leggi fondamentali** (Costituzione, c.c., c.p., c.p.c., c.p.p., c.p.a., TUB, TUF, TUIR, TUEL, TU edilizia, ecc.) richiamabili per nome, con l'allegato giusto già selezionato
 - **Ricerca semplice**: cerca atti normativi per parole chiave
 - **Ricerca avanzata**: filtra per tipo di atto, date, vigenza, numero
 - **Trova atto specifico**: trova una norma precisa (es. "D.Lgs. 152/2006")
-- **Dettaglio atto**: recupera il testo di un atto (un singolo articolo o l'intero testo), identificandolo per tipo+numero+anno (es. "R.D. 639/1910") oppure per codice redazionale
 - **Atti aggiornati**: monitora le modifiche normative recenti
 - **Tipologie e collezioni**: elenca i tipi di atto e le raccolte predefinite
 
@@ -88,13 +89,23 @@ Claude utilizzerà automaticamente gli strumenti del server MCP per interrogare 
 
 | Strumento | Descrizione |
 |-----------|-------------|
+| `dettaglio_atto` | Testo di un atto o di un articolo (anche `-bis`/`-ter`); identificabile per `nome_codice`, tipo+numero+anno o codice redazionale |
+| `corpi_normativi` | Elenco dei codici/testi unici/leggi fondamentali richiamabili con `nome_codice` |
 | `ricerca_semplice` | Ricerca per parole chiave nel titolo e testo |
 | `ricerca_avanzata` | Ricerca con filtri (tipo atto, date, vigenza, ecc.) |
 | `trova_atto_specifico` | Trova un atto per tipo + numero + anno |
-| `dettaglio_atto` | Testo di un atto (per articolo o intero); identificabile per tipo+numero+anno o per codice redazionale |
 | `atti_aggiornati` | Atti modificati in un periodo |
 | `tipi_atto` | Elenco tipologie di atti |
 | `collezioni_predefinite` | Raccolte preconfezionate |
+
+### Esempi di richieste dirette
+
+```
+dettaglio_atto(nome_codice="codice civile", articolo=2043)      → art. 2043 c.c.
+dettaglio_atto(nome_codice="c.p.", articolo=609, estensione="bis") → art. 609-bis c.p.
+dettaglio_atto(nome_codice="cpa", articolo=29)                  → art. 29 c.p.a.
+dettaglio_atto(tipo_atto="DECRETO LEGISLATIVO", numero=152, anno=2006, articolo=192)
+```
 
 ## Codici tipo atto più comuni
 
@@ -115,7 +126,8 @@ Claude utilizzerà automaticamente gli strumenti del server MCP per interrogare 
 - L'endpoint di produzione è `https://api.normattiva.it`
 - Il server usa il trasporto `stdio` (standard per MCP con Claude Desktop)
 - I log vengono scritti su `stderr` (non interferiscono con il protocollo MCP)
-- `dettaglio_atto` gestisce anche i **testi unici e i codici approvati con decreto** (es. codice penale, R.D. 639/1910): i loro articoli sono nell'allegato dell'atto e vengono recuperati automaticamente. Fa eccezione il corpo del **codice civile**, che Normattiva non espone come articoli tramite queste API Open Data.
+- `dettaglio_atto` gestisce anche i **testi unici e i codici approvati con decreto** (codice civile, penale, procedura civile/penale, c.p.a., TULPS, legge fallimentare, ecc.): i loro articoli stanno negli **allegati** dell'atto (`flagTipoArticolo` dell'API: 0 = corpo, N = allegato N-esimo) e vengono cercati automaticamente in corpo e allegati 1–3. Il **codice civile** è l'allegato 2 del R.D. 262/1942 (l'allegato 1 sono le preleggi); il **c.p.a.** è l'allegato 2 del D.Lgs. 104/2010.
+- Gli articoli con estensione (`-bis`, `-ter`, … fino a `-vicies`) si recuperano con `articolo=N` + `estensione` (campo `sottoArticolo` dell'API: 2 = bis, 3 = ter, …).
 
 ## Licenza
 
