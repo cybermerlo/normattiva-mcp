@@ -26,9 +26,20 @@ const API_PREFIX = "/bff-opendata/v1/api/v1";
 // Usa l'ambiente di produzione per default
 const API_BASE = `${BASE_URL}${API_PREFIX}`;
 
+// Header per le richieste POST (con body JSON).
 const COMMON_HEADERS: Record<string, string> = {
   "Accept": "application/json, text/plain, */*",
   "Content-Type": "application/json",
+  "User-Agent": "NormattivaMCP/1.0",
+};
+
+// Header per le richieste GET: identici ai COMMON_HEADERS ma SENZA "Content-Type".
+// Una GET non ha body, quindi inviare "Content-Type: application/json" è una
+// firma anomala che l'anti-bot del Poligrafico e Zecca dello Stato blocca con
+// HTTP 409 ("La pagina richiesta e' stata bloccata dai sistemi di protezione").
+// Rimuovendo Content-Type sulle GET le richieste passano correttamente (200).
+const GET_HEADERS: Record<string, string> = {
+  "Accept": "application/json, text/plain, */*",
   "User-Agent": "NormattivaMCP/1.0",
 };
 
@@ -42,7 +53,7 @@ async function apiGet(endpoint: string): Promise<unknown> {
   
   const response = await fetch(url, {
     method: "GET",
-    headers: COMMON_HEADERS,
+    headers: GET_HEADERS,
   });
 
   if (!response.ok) {
@@ -98,7 +109,8 @@ function formatListaAtti(data: any): string {
       result += ` ${atto.tipoSupplementoIt}`;
     }
     result += `\n`;
-    result += `Codice redazionale: ${atto.codiceRedazionale}\n`;
+    result += `Codice redazionale: ${atto.codiceRedazionale} — dataGU: ${atto.dataGU}\n`;
+    result += `→ testo: dettaglio_atto(codice_redazionale="${atto.codiceRedazionale}", data_gu="${atto.dataGU}")\n`;
     result += `\n`;
   }
 
@@ -120,6 +132,101 @@ function formatListaAtti(data: any): string {
   }
 
   return result;
+}
+
+/**
+ * Converte l'HTML (Akoma Ntoso) di un articolo in testo leggibile.
+ */
+function htmlToText(html: string): string {
+  let s = html || "";
+  // Tag a livello di blocco -> a capo
+  s = s.replace(/<\s*br\s*\/?>/gi, "\n");
+  s = s.replace(/<\/\s*(p|div|h[1-6]|li|tr|article|section)\s*>/gi, "\n");
+  // Rimuovi tutti i tag rimanenti (mantenendo il testo dei link)
+  s = s.replace(/<[^>]+>/g, "");
+  // Decodifica entità numeriche
+  s = s.replace(/&#(\d+);/g, (_m, d) => { try { return String.fromCharCode(parseInt(d, 10)); } catch { return ""; } });
+  s = s.replace(/&#x([0-9a-fA-F]+);/g, (_m, h) => { try { return String.fromCharCode(parseInt(h, 16)); } catch { return ""; } });
+  // Decodifica entità con nome più comuni nei testi normativi italiani
+  const named: Record<string, string> = {
+    "&agrave;": "à", "&egrave;": "è", "&eacute;": "é", "&igrave;": "ì", "&ograve;": "ò", "&ugrave;": "ù",
+    "&Agrave;": "À", "&Egrave;": "È", "&Eacute;": "É", "&Igrave;": "Ì", "&Ograve;": "Ò", "&Ugrave;": "Ù",
+    "&nbsp;": " ", "&laquo;": "«", "&raquo;": "»", "&sect;": "§", "&deg;": "°",
+    "&quot;": "\"", "&apos;": "'", "&lt;": "<", "&gt;": ">", "&amp;": "&",
+  };
+  for (const [k, v] of Object.entries(named)) s = s.split(k).join(v);
+  // Normalizza gli spazi mantenendo la struttura in righe
+  s = s.replace(/ /g, " ").replace(/\r/g, "");
+  s = s.split("\n").map((l) => l.replace(/[ \t]+/g, " ").trim()).join("\n");
+  s = s.replace(/\n{3,}/g, "\n\n").trim();
+  return s;
+}
+
+/**
+ * POST che restituisce lo status HTTP senza lanciare eccezioni,
+ * per poter distinguere "atto/articolo non trovato" (404) dagli altri esiti.
+ */
+async function apiPostStatus(endpoint: string, body: unknown): Promise<{ status: number; data: any }> {
+  const url = `${API_BASE}${endpoint}`;
+  const response = await fetch(url, {
+    method: "POST",
+    headers: COMMON_HEADERS,
+    body: JSON.stringify(body),
+  });
+  let data: any = null;
+  try {
+    const ct = response.headers.get("content-type") || "";
+    data = ct.includes("application/json") ? await response.json() : await response.text();
+  } catch {
+    data = null;
+  }
+  return { status: response.status, data };
+}
+
+type ArticoloResult =
+  | { kind: "article"; label: string; testo: string }
+  | { kind: "empty" }
+  | { kind: "notfound" }
+  | { kind: "error"; status: number };
+
+/**
+ * Recupera un singolo articolo (o l'intestazione) dell'atto tramite l'endpoint
+ * POST /atto/dettaglio-atto. `idArticolo` corrisponde al numero dell'articolo.
+ */
+async function fetchDettaglioArticolo(
+  baseBody: Record<string, unknown>,
+  idArticolo?: number,
+): Promise<{ res: ArticoloResult; atto: any }> {
+  const body = idArticolo != null ? { ...baseBody, idArticolo } : { ...baseBody };
+  const { status, data } = await apiPostStatus("/atto/dettaglio-atto", body);
+  if (status === 404) return { res: { kind: "notfound" }, atto: null };
+  if (status !== 200 || !data) return { res: { kind: "error", status }, atto: null };
+
+  const atto = data?.data?.atto ?? null;
+  const html: string = atto?.articoloHtml ?? "";
+  // Un articolo con testo reale contiene l'intestazione AKN "article-num-akn".
+  if (html.includes("article-num-akn")) {
+    const m = html.match(/article-num-akn[^>]*>([^<]+)</);
+    const label = m ? m[1].trim() : (idArticolo != null ? `Art. ${idArticolo}` : "");
+    // Rimuovi l'intestazione "Art. N" dal corpo: è già mostrata come label in grassetto.
+    const bodyHtml = html.replace(/<h2[^>]*article-num-akn[^>]*>[\s\S]*?<\/h2>/gi, "");
+    return { res: { kind: "article", label, testo: htmlToText(bodyHtml) }, atto };
+  }
+  return { res: { kind: "empty" }, atto };
+}
+
+/**
+ * Compone l'intestazione leggibile di un atto a partire dall'oggetto `atto`.
+ */
+function formatIntestazioneAtto(atto: any, codiceRedazionale: string, dataGU: string, dataVigenza?: string): string {
+  let h = `**${atto?.titolo || codiceRedazionale}**\n`;
+  if (atto?.sottoTitolo) h += `${String(atto.sottoTitolo).replace(/\r/g, "").trim()}\n`;
+  if (atto?.numeroGU && atto?.giornoGU && atto?.meseGU && atto?.annoGU) {
+    h += `GU n. ${atto.numeroGU} del ${String(atto.giornoGU).padStart(2, "0")}/${String(atto.meseGU).padStart(2, "0")}/${atto.annoGU}\n`;
+  }
+  h += `Codice redazionale: ${codiceRedazionale} — dataGU: ${dataGU}`;
+  if (dataVigenza) h += ` — vigenza: ${dataVigenza}`;
+  return h;
 }
 
 // ============================================================================
@@ -289,28 +396,88 @@ server.tool(
 // --------------------------------------------------------------------------
 server.tool(
   "dettaglio_atto",
-  `Recupera il dettaglio completo di un atto normativo, incluso il testo integrale. Richiede il codice redazionale dell'atto (es. '24G00231'), che si ottiene dai risultati delle ricerche. Restituisce il testo completo dell'atto nella versione vigente.`,
+  `Recupera il testo di un atto normativo dalla banca dati Normattiva. Richiede il codice redazionale E la data di pubblicazione in Gazzetta Ufficiale (data_gu, formato YYYY-MM-DD): entrambi si ottengono dai risultati di ricerca_semplice, ricerca_avanzata o trova_atto_specifico. Senza il parametro 'articolo' restituisce l'intestazione e l'art. 1; usa 'articolo' per un articolo specifico (es. articolo=192), oppure 'testo_completo'=true per l'intero testo dell'atto.`,
   {
-    codice_redazionale: z.string().describe("Codice redazionale dell'atto (es. '24G00231', '06G00171'). Si ottiene dai risultati della ricerca semplice o avanzata."),
-    data_vigenza: z.string().optional().describe("Data di vigenza (YYYY-MM-DD) per ottenere la versione vigente a quella data"),
+    codice_redazionale: z.string().describe("Codice redazionale dell'atto (es. '006G0171', '26G00130'). Si ottiene dai risultati della ricerca."),
+    data_gu: z.string().describe("Data di pubblicazione in Gazzetta Ufficiale, formato YYYY-MM-DD (campo 'dataGU' dei risultati della ricerca, es. '2006-04-14'). Obbligatoria."),
+    articolo: z.number().int().min(1).optional().describe("Numero dell'articolo da recuperare (es. 192). Se omesso, restituisce l'intestazione e l'art. 1."),
+    data_vigenza: z.string().optional().describe("Data di vigenza (YYYY-MM-DD) per ottenere il testo vigente a quella data. Se omesso, versione vigente attuale."),
+    testo_completo: z.boolean().default(false).describe("Se true, recupera tutti gli articoli dell'atto (fino a un massimo di 40). Ignorato se è specificato 'articolo'."),
   },
-  async ({ codice_redazionale, data_vigenza }) => {
+  async ({ codice_redazionale, data_gu, articolo, data_vigenza, testo_completo }) => {
     try {
-      let endpoint = `/visualizzazione/dettaglio/${codice_redazionale}`;
-      if (data_vigenza) {
-        endpoint += `?dataVigenza=${data_vigenza}`;
+      const baseBody: Record<string, unknown> = {
+        dataGU: data_gu,
+        codiceRedazionale: codice_redazionale,
+      };
+      if (data_vigenza) baseBody.dataVigenza = data_vigenza;
+
+      // --- Caso 1: articolo specifico ---
+      if (articolo != null) {
+        const { res, atto } = await fetchDettaglioArticolo(baseBody, articolo);
+        if (res.kind === "notfound") {
+          return {
+            content: [{ type: "text", text: `Articolo ${articolo} non trovato per l'atto ${codice_redazionale} (dataGU ${data_gu}). L'atto potrebbe avere meno articoli, oppure codice_redazionale/data_gu non sono corretti (verifica con una ricerca).` }],
+            isError: true,
+          };
+        }
+        if (res.kind === "error") {
+          return { content: [{ type: "text", text: `Errore nel recupero dell'articolo ${articolo} (HTTP ${res.status}).` }], isError: true };
+        }
+        const intest = formatIntestazioneAtto(atto, codice_redazionale, data_gu, data_vigenza);
+        if (res.kind === "empty") {
+          return { content: [{ type: "text", text: `${intest}\n\nIl testo dell'articolo ${articolo} non è disponibile (atto molto recente o articolo privo di testo consolidato).` }] };
+        }
+        return { content: [{ type: "text", text: `${intest}\n\n---\n**${res.label}**\n${res.testo}` }] };
       }
 
-      const data = await apiGet(endpoint);
-      
-      // Il dettaglio può avere formati diversi, gestiamo il caso generico
-      if (typeof data === "string") {
-        return { content: [{ type: "text", text: data }] };
+      // --- Caso 2/3: intero atto o intestazione + art. 1 ---
+      const first = await fetchDettaglioArticolo(baseBody, 1);
+      if (first.res.kind === "notfound") {
+        // Prova senza idArticolo: se l'atto esiste, mostra almeno l'intestazione
+        const bare = await fetchDettaglioArticolo(baseBody, undefined);
+        if (bare.atto) {
+          return { content: [{ type: "text", text: `${formatIntestazioneAtto(bare.atto, codice_redazionale, data_gu, data_vigenza)}\n\n(Nessun testo di articolo disponibile per questo atto.)` }] };
+        }
+        return {
+          content: [{ type: "text", text: `Atto non trovato. Verifica codice_redazionale ("${codice_redazionale}") e data_gu ("${data_gu}"): entrambi vanno presi dai risultati di ricerca_semplice/avanzata o trova_atto_specifico.` }],
+          isError: true,
+        };
       }
-      
-      return {
-        content: [{ type: "text", text: JSON.stringify(data, null, 2) }],
-      };
+      if (first.res.kind === "error") {
+        return { content: [{ type: "text", text: `Errore nel recupero dell'atto (HTTP ${first.res.status}).` }], isError: true };
+      }
+
+      const intest = formatIntestazioneAtto(first.atto, codice_redazionale, data_gu, data_vigenza);
+      if (first.res.kind === "empty") {
+        return { content: [{ type: "text", text: `${intest}\n\nIl testo consolidato degli articoli non è ancora disponibile per questo atto (probabilmente molto recente). È consultabile nella Gazzetta Ufficiale indicata.` }] };
+      }
+
+      // Abbiamo il testo dell'art. 1
+      if (!testo_completo) {
+        return {
+          content: [{ type: "text", text: `${intest}\n\n---\n**${first.res.label}**\n${first.res.testo}\n\n---\n*L'atto contiene più articoli. Usa \`articolo=N\` per un articolo specifico (es. \`articolo=2\`), oppure \`testo_completo=true\` per l'intero testo.*` }],
+        };
+      }
+
+      // --- Testo completo: scorre gli articoli in piccoli batch fino alla fine (404) ---
+      const CAP = 40;
+      const BATCH = 6;
+      const parts: string[] = [`**${first.res.label}**\n${first.res.testo}`];
+      let ended = false;
+      for (let start = 2; start <= CAP && !ended; start += BATCH) {
+        const nums: number[] = [];
+        for (let k = start; k < start + BATCH && k <= CAP; k++) nums.push(k);
+        const results = await Promise.all(nums.map((n) => fetchDettaglioArticolo(baseBody, n)));
+        for (let i = 0; i < results.length; i++) {
+          const r = results[i].res;
+          if (r.kind !== "article") { ended = true; break; }
+          parts.push(`**${r.label}**\n${r.testo}`);
+        }
+      }
+      let out = `${intest}\n\n${parts.join("\n\n---\n")}`;
+      if (!ended) out += `\n\n---\n*Testo troncato ai primi ${CAP} articoli. Usa \`articolo=N\` per consultare gli articoli successivi.*`;
+      return { content: [{ type: "text", text: out }] };
     } catch (error) {
       return {
         content: [{ type: "text", text: `Errore nel recupero del dettaglio: ${error instanceof Error ? error.message : String(error)}` }],
@@ -325,18 +492,22 @@ server.tool(
 // --------------------------------------------------------------------------
 server.tool(
   "atti_aggiornati",
-  `Recupera la lista degli atti normativi che sono stati aggiornati (modificati) in un determinato periodo. Utile per monitorare le novità normative e le modifiche recenti alla legislazione.`,
+  `Recupera la lista degli atti normativi aggiornati (modificati) in un determinato periodo. Utile per monitorare le novità normative e le modifiche recenti alla legislazione. L'intervallo non può superare i 12 mesi e i risultati sono limitati a 7000 atti.`,
   {
     data_inizio: z.string().describe("Data inizio periodo nel formato YYYY-MM-DD"),
-    data_fine: z.string().describe("Data fine periodo nel formato YYYY-MM-DD"),
+    data_fine: z.string().describe("Data fine periodo nel formato YYYY-MM-DD (l'intervallo massimo consentito è 12 mesi)"),
     pagina: z.number().int().min(1).default(1).describe("Numero di pagina"),
     risultati_per_pagina: z.number().int().min(1).max(50).default(10).describe("Risultati per pagina"),
   },
   async ({ data_inizio, data_fine, pagina, risultati_per_pagina }) => {
     try {
+      // L'API richiede i campi dataInizioAggiornamento/dataFineAggiornamento come
+      // timestamp ISO. Convertiamo le date (YYYY-MM-DD) coprendo l'intera giornata.
+      const toIso = (d: string, fineGiornata: boolean) =>
+        d.includes("T") ? d : `${d}T${fineGiornata ? "23:59:59.999" : "00:00:00.000"}Z`;
       const body = {
-        dataInizio: data_inizio,
-        dataFine: data_fine,
+        dataInizioAggiornamento: toIso(data_inizio, false),
+        dataFineAggiornamento: toIso(data_fine, true),
         paginazione: {
           paginaCorrente: pagina,
           numeroElementiPerPagina: risultati_per_pagina,
