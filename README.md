@@ -9,7 +9,7 @@ Questo server permette a **Claude** (via Claude Desktop, Cowork, o Claude Code) 
 - **Ricerca semplice**: cerca atti normativi per parole chiave
 - **Ricerca avanzata**: filtra per tipo di atto, date, vigenza, numero
 - **Trova atto specifico**: trova una norma precisa (es. "D.Lgs. 152/2006")
-- **Dettaglio atto**: recupera il testo di un atto (un singolo articolo o l'intero testo) tramite codice redazionale + data GU
+- **Dettaglio atto**: recupera il testo di un atto (un singolo articolo o l'intero testo), identificandolo per tipo+numero+anno (es. "R.D. 639/1910") oppure per codice redazionale
 - **Atti aggiornati**: monitora le modifiche normative recenti
 - **Tipologie e collezioni**: elenca i tipi di atto e le raccolte predefinite
 
@@ -91,7 +91,7 @@ Claude utilizzerà automaticamente gli strumenti del server MCP per interrogare 
 | `ricerca_semplice` | Ricerca per parole chiave nel titolo e testo |
 | `ricerca_avanzata` | Ricerca con filtri (tipo atto, date, vigenza, ecc.) |
 | `trova_atto_specifico` | Trova un atto per tipo + numero + anno |
-| `dettaglio_atto` | Testo di un atto (per articolo o intero) tramite codice redazionale + data GU |
+| `dettaglio_atto` | Testo di un atto (per articolo o intero); identificabile per tipo+numero+anno o per codice redazionale |
 | `atti_aggiornati` | Atti modificati in un periodo |
 | `tipi_atto` | Elenco tipologie di atti |
 | `collezioni_predefinite` | Raccolte preconfezionate |

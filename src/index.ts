@@ -296,6 +296,65 @@ function formatIntestazioneAtto(atto: any, codiceRedazionale: string, dataGU: st
   return h;
 }
 
+/**
+ * Individua codiceRedazionale + dataGU di un atto (entrambi necessari a
+ * /atto/dettaglio-atto) a partire da identificativi parziali:
+ *  1) codice + dataGU espliciti;
+ *  2) tipo_atto + numero + anno (risoluzione affidabile via ricerca avanzata);
+ *  3) solo codice redazionale (ricerca testuale del codice, non sempre indicizzato).
+ */
+async function resolveAtto(p: {
+  codice_redazionale?: string;
+  data_gu?: string;
+  tipo_atto?: string;
+  numero?: number;
+  anno?: number;
+}): Promise<{ codiceRedazionale: string; dataGU: string } | { error: string }> {
+  const stripZeros = (s: unknown) => String(s ?? "").replace(/^0+/, "");
+
+  // 1. Codice + dataGU già disponibili
+  if (p.codice_redazionale && p.data_gu) {
+    return { codiceRedazionale: p.codice_redazionale, dataGU: p.data_gu };
+  }
+
+  // 2. tipo_atto + numero + anno
+  if (p.tipo_atto && p.numero != null && p.anno != null) {
+    const { status, data } = await apiPostStatus("/ricerca/avanzata", {
+      denominazioneAtto: p.tipo_atto,
+      numeroProvvedimento: p.numero,
+      annoProvvedimento: p.anno,
+      orderType: "recente",
+      paginazione: { paginaCorrente: 1, numeroElementiPerPagina: 10 },
+    });
+    const lista: any[] = (status === 200 && data?.listaAtti) || [];
+    let pick = lista[0];
+    if (p.codice_redazionale) {
+      pick = lista.find((a) => stripZeros(a?.codiceRedazionale) === stripZeros(p.codice_redazionale)) || pick;
+    }
+    if (pick?.codiceRedazionale && pick?.dataGU) {
+      return { codiceRedazionale: pick.codiceRedazionale, dataGU: pick.dataGU };
+    }
+    return { error: `Nessun atto trovato per ${p.tipo_atto} n. ${p.numero}/${p.anno}. Verifica i dati oppure usa ricerca_avanzata/trova_atto_specifico.` };
+  }
+
+  // 3. Solo codice redazionale: prova a risolvere la dataGU via ricerca testuale
+  if (p.codice_redazionale) {
+    const { status, data } = await apiPostStatus("/ricerca/semplice", {
+      testoRicerca: p.codice_redazionale,
+      orderType: "recente",
+      paginazione: { paginaCorrente: 1, numeroElementiPerPagina: 10 },
+    });
+    const lista: any[] = (status === 200 && data?.listaAtti) || [];
+    const match = lista.find((a) => stripZeros(a?.codiceRedazionale) === stripZeros(p.codice_redazionale));
+    if (match?.codiceRedazionale && match?.dataGU) {
+      return { codiceRedazionale: match.codiceRedazionale, dataGU: match.dataGU };
+    }
+    return { error: `Impossibile risolvere automaticamente la data di Gazzetta Ufficiale per il codice "${p.codice_redazionale}". Fornisci anche 'data_gu' (campo dataGU dei risultati di ricerca) oppure identifica l'atto con 'tipo_atto' + 'numero' + 'anno'.` };
+  }
+
+  return { error: "Identifica l'atto con 'codice_redazionale' (più 'data_gu' se disponibile) oppure con 'tipo_atto' + 'numero' + 'anno'." };
+}
+
 // ============================================================================
 // SERVER MCP
 // ============================================================================
@@ -463,21 +522,30 @@ server.tool(
 // --------------------------------------------------------------------------
 server.tool(
   "dettaglio_atto",
-  `Recupera il testo di un atto normativo dalla banca dati Normattiva. Richiede il codice redazionale E la data di pubblicazione in Gazzetta Ufficiale (data_gu, formato YYYY-MM-DD): entrambi si ottengono dai risultati di ricerca_semplice, ricerca_avanzata o trova_atto_specifico. Senza il parametro 'articolo' restituisce l'intestazione e l'art. 1; usa 'articolo' per un articolo specifico (es. articolo=192), oppure 'testo_completo'=true per l'intero testo dell'atto. Gestisce anche i testi unici e i codici approvati con decreto (es. codice penale, R.D. 639/1910), i cui articoli sono contenuti nell'allegato.`,
+  `Recupera il testo di un atto normativo dalla banca dati Normattiva. Identifica l'atto in uno di questi modi: (a) codice_redazionale + data_gu (dai risultati di ricerca_semplice/avanzata o trova_atto_specifico); (b) tipo_atto + numero + anno (es. 'REGIO DECRETO' 639 1910), senza bisogno di una ricerca preliminare; (c) solo codice_redazionale (la data GU viene risolta automaticamente). Senza 'articolo' restituisce l'intestazione e l'art. 1; usa 'articolo' per un articolo specifico (es. articolo=192), o 'testo_completo'=true per l'intero testo. Gestisce anche i testi unici e i codici approvati con decreto (es. codice penale, R.D. 639/1910), i cui articoli sono nell'allegato.`,
   {
-    codice_redazionale: z.string().describe("Codice redazionale dell'atto (es. '006G0171', '26G00130'). Si ottiene dai risultati della ricerca."),
-    data_gu: z.string().describe("Data di pubblicazione in Gazzetta Ufficiale, formato YYYY-MM-DD (campo 'dataGU' dei risultati della ricerca, es. '2006-04-14'). Obbligatoria."),
+    codice_redazionale: z.string().optional().describe("Codice redazionale dell'atto (es. '006G0171', '010U0639'), dai risultati di ricerca. In alternativa usa tipo_atto+numero+anno."),
+    data_gu: z.string().optional().describe("Data di pubblicazione in Gazzetta Ufficiale (YYYY-MM-DD, campo 'dataGU' dei risultati). Se omessa viene risolta automaticamente dal codice o da tipo_atto+numero+anno."),
+    tipo_atto: z.string().optional().describe("Tipo di atto per identificarlo senza codice (es. 'REGIO DECRETO', 'LEGGE', 'DECRETO LEGISLATIVO'). Da usare con 'numero' e 'anno'."),
+    numero: z.number().int().optional().describe("Numero dell'atto (con tipo_atto e anno)."),
+    anno: z.number().int().optional().describe("Anno dell'atto (con tipo_atto e numero)."),
     articolo: z.number().int().min(1).optional().describe("Numero dell'articolo da recuperare (es. 192). Se omesso, restituisce l'intestazione e l'art. 1."),
     data_vigenza: z.string().optional().describe("Data di vigenza (YYYY-MM-DD) per ottenere il testo vigente a quella data. Se omesso, versione vigente attuale."),
     testo_completo: z.boolean().default(false).describe("Se true, recupera tutti gli articoli dell'atto (fino a un massimo di 40). Ignorato se è specificato 'articolo'."),
   },
-  async ({ codice_redazionale, data_gu, articolo, data_vigenza, testo_completo }) => {
+  async ({ codice_redazionale, data_gu, tipo_atto, numero, anno, articolo, data_vigenza, testo_completo }) => {
     const out = (t: string) => ({ content: [{ type: "text" as const, text: t }] });
     const bad = (t: string) => ({ content: [{ type: "text" as const, text: t }], isError: true });
     try {
+      // Risolve codiceRedazionale + dataGU (entrambi necessari all'API) dai parametri forniti.
+      const resolved = await resolveAtto({ codice_redazionale, data_gu, tipo_atto, numero, anno });
+      if ("error" in resolved) return bad(resolved.error);
+      const cr = resolved.codiceRedazionale;
+      const dg = resolved.dataGU;
+
       const baseBody: Record<string, unknown> = {
-        dataGU: data_gu,
-        codiceRedazionale: codice_redazionale,
+        dataGU: dg,
+        codiceRedazionale: cr,
       };
       if (data_vigenza) baseBody.dataVigenza = data_vigenza;
       const CAP = 40;
@@ -486,12 +554,12 @@ server.tool(
       if (articolo != null) {
         const r = await fetchArticoloAuto(baseBody, articolo);
         if (r.res.kind === "notfound") {
-          return bad(`Articolo ${articolo} non trovato per l'atto ${codice_redazionale} (dataGU ${data_gu}). L'atto potrebbe avere meno articoli, oppure codice_redazionale/data_gu non sono corretti (verifica con una ricerca).`);
+          return bad(`Articolo ${articolo} non trovato per l'atto ${cr} (dataGU ${dg}). L'atto potrebbe avere meno articoli, oppure codice_redazionale/data_gu non sono corretti (verifica con una ricerca).`);
         }
         if (r.res.kind === "error") {
           return bad(`Errore nel recupero dell'articolo ${articolo} (HTTP ${r.res.status}).`);
         }
-        const intest = formatIntestazioneAtto(r.atto, codice_redazionale, data_gu, data_vigenza);
+        const intest = formatIntestazioneAtto(r.atto, cr, dg, data_vigenza);
         if (r.res.kind === "empty") {
           return out(`${intest}\n\nIl testo dell'articolo ${articolo} non è disponibile (atto molto recente o articolo privo di testo consolidato).`);
         }
@@ -503,7 +571,7 @@ server.tool(
       if (testo_completo) {
         const main = await walkArticoli(baseBody, 0, CAP);
         if (main.articoli.length >= 2) {
-          const intest = formatIntestazioneAtto(main.atto, codice_redazionale, data_gu, data_vigenza);
+          const intest = formatIntestazioneAtto(main.atto, cr, dg, data_vigenza);
           const parts = main.articoli.map((a) => `**${a.label}**\n${a.testo}`);
           let o = `${intest}\n\n${parts.join("\n\n---\n")}`;
           if (!main.ended) o += `\n\n---\n*Testo troncato ai primi ${CAP} articoli. Usa \`articolo=N\` per consultare gli articoli successivi.*`;
@@ -513,20 +581,20 @@ server.tool(
         const alleg = await walkArticoli(baseBody, 1, CAP);
         const atto = alleg.atto || main.atto;
         if (alleg.articoli.length >= 1) {
-          const intest = formatIntestazioneAtto(atto, codice_redazionale, data_gu, data_vigenza);
+          const intest = formatIntestazioneAtto(atto, cr, dg, data_vigenza);
           const parts = alleg.articoli.map((a) => `**${a.label}**\n${a.testo}`);
           let o = `${intest}\n\n*Testo unico allegato:*\n\n${parts.join("\n\n---\n")}`;
           if (!alleg.ended) o += `\n\n---\n*Testo troncato ai primi ${CAP} articoli. Usa \`articolo=N\` per gli articoli successivi.*`;
           return out(o);
         }
         if (main.articoli.length === 1) {
-          const intest = formatIntestazioneAtto(main.atto, codice_redazionale, data_gu, data_vigenza);
+          const intest = formatIntestazioneAtto(main.atto, cr, dg, data_vigenza);
           return out(`${intest}\n\n---\n**${main.articoli[0].label}**\n${main.articoli[0].testo}`);
         }
         if (atto) {
-          return out(`${formatIntestazioneAtto(atto, codice_redazionale, data_gu, data_vigenza)}\n\nIl testo consolidato degli articoli non è ancora disponibile per questo atto.`);
+          return out(`${formatIntestazioneAtto(atto, cr, dg, data_vigenza)}\n\nIl testo consolidato degli articoli non è ancora disponibile per questo atto.`);
         }
-        return bad(`Atto non trovato. Verifica codice_redazionale ("${codice_redazionale}") e data_gu ("${data_gu}"): entrambi vanno presi dai risultati di ricerca_semplice/avanzata o trova_atto_specifico.`);
+        return bad(`Atto non trovato. Verifica codice_redazionale ("${cr}") e data_gu ("${dg}"): entrambi vanno presi dai risultati di ricerca_semplice/avanzata o trova_atto_specifico.`);
       }
 
       // === Caso 3: default — intestazione + art. 1 (con rilevamento testo unico) ===
@@ -535,7 +603,7 @@ server.tool(
         return bad(`Errore nel recupero dell'atto (HTTP ${a1.res.status}).`);
       }
       if (a1.res.kind === "empty") {
-        return out(`${formatIntestazioneAtto(a1.atto, codice_redazionale, data_gu, data_vigenza)}\n\nIl testo consolidato degli articoli non è ancora disponibile per questo atto (probabilmente molto recente). È consultabile nella Gazzetta Ufficiale indicata.`);
+        return out(`${formatIntestazioneAtto(a1.atto, cr, dg, data_vigenza)}\n\nIl testo consolidato degli articoli non è ancora disponibile per questo atto (probabilmente molto recente). È consultabile nella Gazzetta Ufficiale indicata.`);
       }
 
       // Se l'art. 1 è un "Articolo Unico" (o manca del tutto), il contenuto potrebbe essere nell'allegato.
@@ -547,15 +615,15 @@ server.tool(
       if (a1.res.kind === "notfound" || soloArticoloUnico) {
         const alleg1 = await fetchDettaglioArticolo(baseBody, 1, 1);
         if (alleg1.res.kind === "article") {
-          const intest = formatIntestazioneAtto(alleg1.atto || a1.atto, codice_redazionale, data_gu, data_vigenza);
+          const intest = formatIntestazioneAtto(alleg1.atto || a1.atto, cr, dg, data_vigenza);
           return out(`${intest}\n\n*Atto che approva un testo unico: gli articoli sostanziali sono nell'allegato.*\n\n---\n**${alleg1.res.label}**\n${alleg1.res.testo}\n\n---\n*Usa \`articolo=N\` per un articolo (es. \`articolo=3\`), oppure \`testo_completo=true\` per l'intero testo.*`);
         }
         if (a1.res.kind === "notfound") {
           const bare = await fetchDettaglioArticolo(baseBody, undefined, 0);
           if (bare.atto) {
-            return out(`${formatIntestazioneAtto(bare.atto, codice_redazionale, data_gu, data_vigenza)}\n\n(Nessun testo di articolo disponibile per questo atto.)`);
+            return out(`${formatIntestazioneAtto(bare.atto, cr, dg, data_vigenza)}\n\n(Nessun testo di articolo disponibile per questo atto.)`);
           }
-          return bad(`Atto non trovato. Verifica codice_redazionale ("${codice_redazionale}") e data_gu ("${data_gu}"): entrambi vanno presi dai risultati di ricerca_semplice/avanzata o trova_atto_specifico.`);
+          return bad(`Atto non trovato. Verifica codice_redazionale ("${cr}") e data_gu ("${dg}"): entrambi vanno presi dai risultati di ricerca_semplice/avanzata o trova_atto_specifico.`);
         }
         // soloArticoloUnico ma senza allegato: prosegue mostrando l'Articolo Unico.
       }
@@ -563,7 +631,7 @@ server.tool(
       // Atto normale (o Articolo Unico senza allegato): intestazione + art. 1
       const a1art = a1.res.kind === "article" ? a1.res : null;
       if (!a1art) return bad("Errore nel recupero dell'atto.");
-      const intest = formatIntestazioneAtto(a1.atto, codice_redazionale, data_gu, data_vigenza);
+      const intest = formatIntestazioneAtto(a1.atto, cr, dg, data_vigenza);
       return out(`${intest}\n\n---\n**${a1art.label}**\n${a1art.testo}\n\n---\n*L'atto contiene più articoli. Usa \`articolo=N\` per un articolo specifico (es. \`articolo=2\`), oppure \`testo_completo=true\` per l'intero testo.*`);
     } catch (error) {
       return bad(`Errore nel recupero del dettaglio: ${error instanceof Error ? error.message : String(error)}`);
