@@ -1,0 +1,44 @@
+# CI del server MCP Normattiva.
+#
+# - job "smoke" (ogni push + manuale + settimanale): build TypeScript e golden
+#   suite end-to-end via protocollo MCP contro l'API reale (~10 chiamate).
+#   Intercetta sia le regressioni del codice sia il drift dell'API Normattiva.
+# - job "corpi" (solo settimanale + manuale): valida TUTTE le voci della
+#   tabella CORPI_NORMATIVI (codice redazionale + dataGU + allegato) contro
+#   l'API reale — è la parte cablata che si rompe in silenzio.
+name: smoke
+
+on:
+  push:
+    branches: ["**"]
+  workflow_dispatch:
+  schedule:
+    - cron: "0 6 * * 1" # ogni lunedì alle 06:00 UTC
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+      - run: npm run smoke
+
+  corpi:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+      - run: npm run valida-corpi

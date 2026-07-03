@@ -47,27 +47,108 @@ const GET_HEADERS: Record<string, string> = {
 // FUNZIONI HELPER
 // ============================================================================
 
+// Timeout per singola richiesta HTTP: senza, una connessione appesa verso
+// Normattiva blocca il tool fino al timeout del connettore (errore opaco lato
+// Claude). 30s lascia margine anche alle risposte lente dell'API.
+const FETCH_TIMEOUT_MS = 30_000;
+
 /**
- * fetch con un retry sui soli errori transitori (rete, 502/503/504).
+ * Messaggio leggibile per gli status HTTP ricorrenti dell'API Normattiva,
+ * così Claude (e l'utente) sanno cosa fare invece di vedere un codice nudo.
+ */
+function spiegaHttp(status: number): string {
+  if (status === 409 || status === 429) {
+    return `HTTP ${status}: richiesta bloccata temporaneamente dai sistemi di protezione di Normattiva (anti-bot/rate limit). Attendi qualche secondo e riprova, evitando richieste massive ravvicinate.`;
+  }
+  if (status === 404) return "HTTP 404: risorsa non trovata su Normattiva.";
+  if (status >= 500) return `HTTP ${status}: errore temporaneo dei server Normattiva. Riprova tra qualche istante.`;
+  return `HTTP ${status}`;
+}
+
+/**
+ * fetch con timeout (AbortController) e un retry sugli errori transitori:
+ * rete, timeout, 502/503/504 e 409/429 (l'anti-bot del Poligrafico risponde
+ * 409 anche a burst legittimi: una breve pausa di solito basta).
  * Gli status "semantici" (404 = non trovato, 500 = parametri errati)
  * non vengono ritentati.
  */
 async function fetchRetry(url: string, init: RequestInit): Promise<Response> {
   let lastErr: unknown;
   for (let attempt = 0; attempt < 2; attempt++) {
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), FETCH_TIMEOUT_MS);
     try {
-      const res = await fetch(url, init);
+      const res = await fetch(url, { ...init, signal: ctrl.signal });
+      if ([409, 429].includes(res.status) && attempt === 0) {
+        await new Promise((r) => setTimeout(r, 1500));
+        continue;
+      }
       if (![502, 503, 504].includes(res.status) || attempt === 1) return res;
     } catch (e) {
       lastErr = e;
-      if (attempt === 1) throw e;
+      if (attempt === 1) {
+        if ((e as Error)?.name === "AbortError") {
+          throw new Error(`Nessuna risposta da Normattiva entro ${FETCH_TIMEOUT_MS / 1000}s (timeout). Riprova tra qualche istante.`);
+        }
+        throw e;
+      }
+    } finally {
+      clearTimeout(timer);
     }
     await new Promise((r) => setTimeout(r, 700));
+  }
+  if (lastErr instanceof Error && lastErr.name === "AbortError") {
+    throw new Error(`Nessuna risposta da Normattiva entro ${FETCH_TIMEOUT_MS / 1000}s (timeout). Riprova tra qualche istante.`);
   }
   throw lastErr instanceof Error ? lastErr : new Error(String(lastErr));
 }
 
+// ============================================================================
+// CACHE (LRU + TTL)
+// ============================================================================
+// I testi vigenti cambiano di rado: ricolpire Normattiva a ogni richiesta
+// aggiunge latenza e, sotto burst (testo_completo, più utenti sullo stesso
+// server), rischia il blocco anti-bot dell'IP. Cache in-memory con TTL per
+// endpoint e tetto di voci: il processo resta vivo tra le richieste (stdio
+// come dietro supergateway), quindi la cache paga da subito.
+
+const CACHE_MAX = 500;
+const cache = new Map<string, { exp: number; val: unknown }>();
+
+function cacheTtlFor(endpoint: string): number {
+  if (endpoint.startsWith("/atto/dettaglio-atto")) return 6 * 3_600_000;    // 6 ore
+  if (endpoint.startsWith("/tipologiche") || endpoint.startsWith("/collections")) return 24 * 3_600_000;
+  if (endpoint.startsWith("/ricerca")) return 30 * 60_000;                  // 30 minuti
+  return 0;
+}
+
+function cacheGet(key: string): unknown {
+  const e = cache.get(key);
+  if (!e) return undefined;
+  if (Date.now() > e.exp) {
+    cache.delete(key);
+    return undefined;
+  }
+  // Rinfresca la posizione LRU (Map preserva l'ordine di inserimento).
+  cache.delete(key);
+  cache.set(key, e);
+  return e.val;
+}
+
+function cacheSet(key: string, val: unknown, ttl: number): void {
+  if (ttl <= 0) return;
+  if (cache.size >= CACHE_MAX) {
+    const oldest = cache.keys().next().value;
+    if (oldest !== undefined) cache.delete(oldest);
+  }
+  cache.set(key, { exp: Date.now() + ttl, val });
+}
+
 async function apiGet(endpoint: string): Promise<unknown> {
+  const key = `GET ${endpoint}`;
+  const hit = cacheGet(key);
+  if (hit !== undefined) return hit;
+
   const url = `${API_BASE}${endpoint}`;
   console.error(`[Normattiva MCP] GET ${url}`);
 
@@ -77,14 +158,20 @@ async function apiGet(endpoint: string): Promise<unknown> {
   });
 
   if (!response.ok) {
-    const errorText = await response.text();
-    throw new Error(`Errore API Normattiva (${response.status}): ${errorText}`);
+    await response.text().catch(() => "");
+    throw new Error(`Errore API Normattiva — ${spiegaHttp(response.status)}`);
   }
 
-  return response.json();
+  const data = await response.json();
+  cacheSet(key, data, cacheTtlFor(endpoint));
+  return data;
 }
 
 async function apiPost(endpoint: string, body: unknown): Promise<unknown> {
+  const key = `POST ${endpoint} ${JSON.stringify(body)}`;
+  const hit = cacheGet(key);
+  if (hit !== undefined) return hit;
+
   const url = `${API_BASE}${endpoint}`;
   console.error(`[Normattiva MCP] POST ${url}`);
   console.error(`[Normattiva MCP] Body: ${JSON.stringify(body)}`);
@@ -96,16 +183,17 @@ async function apiPost(endpoint: string, body: unknown): Promise<unknown> {
   });
 
   if (!response.ok) {
-    const errorText = await response.text();
-    throw new Error(`Errore API Normattiva (${response.status}): ${errorText}`);
+    await response.text().catch(() => "");
+    throw new Error(`Errore API Normattiva — ${spiegaHttp(response.status)}`);
   }
 
   // Alcune API restituiscono testo semplice (es. token), altre JSON
   const contentType = response.headers.get("content-type") || "";
-  if (contentType.includes("application/json")) {
-    return response.json();
-  }
-  return response.text();
+  const data = contentType.includes("application/json")
+    ? await response.json()
+    : await response.text();
+  cacheSet(key, data, cacheTtlFor(endpoint));
+  return data;
 }
 
 /**
@@ -165,8 +253,8 @@ function htmlToText(html: string): string {
   // Rimuovi tutti i tag rimanenti (mantenendo il testo dei link)
   s = s.replace(/<[^>]+>/g, "");
   // Decodifica entità numeriche
-  s = s.replace(/&#(\d+);/g, (_m, d) => { try { return String.fromCharCode(parseInt(d, 10)); } catch { return ""; } });
-  s = s.replace(/&#x([0-9a-fA-F]+);/g, (_m, h) => { try { return String.fromCharCode(parseInt(h, 16)); } catch { return ""; } });
+  s = s.replace(/&#(\d+);/g, (_m, d) => { try { return String.fromCodePoint(parseInt(d, 10)); } catch { return ""; } });
+  s = s.replace(/&#x([0-9a-fA-F]+);/g, (_m, h) => { try { return String.fromCodePoint(parseInt(h, 16)); } catch { return ""; } });
   // Decodifica entità con nome più comuni nei testi normativi italiani
   const named: Record<string, string> = {
     "&agrave;": "à", "&egrave;": "è", "&eacute;": "é", "&igrave;": "ì", "&ograve;": "ò", "&ugrave;": "ù",
@@ -187,6 +275,10 @@ function htmlToText(html: string): string {
  * per poter distinguere "atto/articolo non trovato" (404) dagli altri esiti.
  */
 async function apiPostStatus(endpoint: string, body: unknown): Promise<{ status: number; data: any }> {
+  const key = `POSTS ${endpoint} ${JSON.stringify(body)}`;
+  const hit = cacheGet(key) as { status: number; data: any } | undefined;
+  if (hit !== undefined) return hit;
+
   const url = `${API_BASE}${endpoint}`;
   const response = await fetchRetry(url, {
     method: "POST",
@@ -200,7 +292,13 @@ async function apiPostStatus(endpoint: string, body: unknown): Promise<{ status:
   } catch {
     data = null;
   }
-  return { status: response.status, data };
+  const result = { status: response.status, data };
+  // Si cacheano solo gli esiti stabili: 200 (contenuto) e 404 (assenza
+  // "semantica", es. articolo oltre l'ultimo). Mai gli errori transitori.
+  if (response.status === 200 || response.status === 404) {
+    cacheSet(key, result, cacheTtlFor(endpoint));
+  }
+  return result;
 }
 
 type ArticoloResult =
@@ -510,17 +608,21 @@ function trovaCorpoNormativo(nome: string): { corpo: CorpoNormativo } | { error:
 const server = new McpServer(
   {
     name: "normattiva",
-    version: "1.1.0",
+    version: "1.2.0",
   },
   {
     instructions: `Server MCP per la normativa italiana (banca dati ufficiale Normattiva). I testi restituiti sono nella versione vigente (multivigente), salvo diversa data_vigenza.
+
+USO PROATTIVO: quando la risposta dipende dal contenuto esatto di norme italiane che sai identificare, recupera il testo con dettaglio_atto PRIMA di citarle, spiegarle o applicarle — anche se l'utente non chiede espressamente di "recuperare la norma". Non citare articoli a memoria (rischio di errori e abrogazioni non recepite); fondati sul testo restituito e indica la fonte.
 
 Come scegliere lo strumento:
 1. Articolo di un codice/testo unico noto (es. art. 2043 c.c., art. 575 c.p., art. 29 c.p.a., art. 36 TU pubblico impiego): dettaglio_atto con nome_codice (+articolo, eventualmente estensione='bis'/'ter'/...). L'elenco dei nomi supportati è nel tool corpi_normativi.
 2. Atto identificato da una citazione (es. D.Lgs. 152/2006, L. 241/1990): dettaglio_atto con tipo_atto + numero + anno (+articolo). Nessuna ricerca preliminare necessaria.
 3. Ricerca tematica o atto non identificato: ricerca_semplice o ricerca_avanzata, poi dettaglio_atto con codice_redazionale + data_gu presi dai risultati.
 4. Novità e modifiche normative in un periodo: atti_aggiornati.
-I codici e i testi unici approvati con decreto (codice civile, penale, ecc.) hanno gli articoli negli allegati dell'atto: dettaglio_atto li gestisce automaticamente (nome_codice seleziona già l'allegato giusto).`,
+I codici e i testi unici approvati con decreto (codice civile, penale, ecc.) hanno gli articoli negli allegati dell'atto: dettaglio_atto li gestisce automaticamente (nome_codice seleziona già l'allegato giusto).
+
+Se nella sessione è disponibile anche un connettore dedicato a specifici codici (es. iCodici, strumento recupera_articoli), per gli articoli dei codici che quello copre puoi preferirlo (batch più rapidi); usa questo server per il resto della legislazione, per le ricerche e per le vigenze storiche.`,
   }
 );
 
@@ -670,7 +772,7 @@ server.tool(
 // --------------------------------------------------------------------------
 server.tool(
   "dettaglio_atto",
-  `Recupera il testo di un atto normativo dalla banca dati Normattiva (versione vigente). Identifica l'atto in uno di questi modi, in ordine di preferenza: (a) nome_codice per codici, testi unici e leggi fondamentali (es. nome_codice='codice civile' articolo=2043; nome_codice='c.p.' articolo=575): seleziona automaticamente l'atto e l'allegato giusti — elenco dei nomi nel tool corpi_normativi; (b) tipo_atto + numero + anno (es. 'DECRETO LEGISLATIVO' 152 2006), senza ricerca preliminare; (c) codice_redazionale + data_gu dai risultati di ricerca; (d) solo codice_redazionale (data GU risolta automaticamente). Per gli articoli con estensione usa 'estensione' (es. articolo=609, estensione='bis'). Senza 'articolo' restituisce l'intestazione e l'art. 1; 'testo_completo'=true recupera l'intero testo (max 40 articoli). I testi unici/codici approvati con decreto hanno gli articoli negli allegati: vengono cercati automaticamente anche lì.`,
+  `Recupera il testo di un atto normativo dalla banca dati Normattiva (versione vigente). Usalo PROATTIVAMENTE prima di citare, spiegare o applicare una norma: fonda la risposta sul testo vigente invece di citare a memoria. Identifica l'atto in uno di questi modi, in ordine di preferenza: (a) nome_codice per codici, testi unici e leggi fondamentali (es. nome_codice='codice civile' articolo=2043; nome_codice='c.p.' articolo=575): seleziona automaticamente l'atto e l'allegato giusti — elenco dei nomi nel tool corpi_normativi; (b) tipo_atto + numero + anno (es. 'DECRETO LEGISLATIVO' 152 2006), senza ricerca preliminare; (c) codice_redazionale + data_gu dai risultati di ricerca; (d) solo codice_redazionale (data GU risolta automaticamente). Per gli articoli con estensione usa 'estensione' (es. articolo=609, estensione='bis'). Senza 'articolo' restituisce l'intestazione e l'art. 1; 'testo_completo'=true recupera l'intero testo (max 40 articoli). I testi unici/codici approvati con decreto hanno gli articoli negli allegati: vengono cercati automaticamente anche lì. Limite noto: i sotto-articoli "decimali" (es. art. 114.1 TUB, art. 452-bis.1 c.p.) non sono indirizzabili tramite questa API — se non trovi un articolo di quel tipo, dillo all'utente invece di riprovare.`,
   {
     nome_codice: z.string().optional().describe("Nome comune di un codice/testo unico/legge fondamentale (es. 'codice civile', 'c.p.', 'c.p.a.', 'TU edilizia', 'TUB', 'legge 241'). Identifica direttamente l'atto e l'allegato corretti. Elenco completo nel tool corpi_normativi."),
     codice_redazionale: z.string().optional().describe("Codice redazionale dell'atto (es. '006G0171', '010U0639'), dai risultati di ricerca. In alternativa usa nome_codice oppure tipo_atto+numero+anno."),
@@ -737,7 +839,7 @@ server.tool(
           return bad(`Articolo ${etichettaArt} non trovato ${dove}. Verifica il numero e l'eventuale estensione; per gli atti generici controlla codice_redazionale/data_gu con una ricerca.`);
         }
         if (r.res.kind === "error") {
-          return bad(`Errore nel recupero dell'articolo ${etichettaArt} (HTTP ${r.res.status}).`);
+          return bad(`Errore nel recupero dell'articolo ${etichettaArt} — ${spiegaHttp(r.res.status)}`);
         }
         const intest = conCorpo(formatIntestazioneAtto(r.atto, cr, dg, data_vigenza));
         if (r.res.kind === "empty") {
@@ -802,7 +904,7 @@ server.tool(
           const intest = conCorpo(formatIntestazioneAtto(a1f.atto, cr, dg, data_vigenza));
           return out(`${intest}\n\n---\n**${a1f.res.label}**\n${a1f.res.testo}\n\n---\n*Usa \`articolo=N\` (con eventuale \`estensione\`) per un articolo specifico, oppure \`testo_completo=true\` per l'intero testo.*`);
         }
-        if (a1f.res.kind === "error") return bad(`Errore nel recupero dell'atto (HTTP ${a1f.res.status}).`);
+        if (a1f.res.kind === "error") return bad(`Errore nel recupero dell'atto — ${spiegaHttp(a1f.res.status)}`);
         if (a1f.res.kind === "empty" && a1f.atto) {
           return out(`${conCorpo(formatIntestazioneAtto(a1f.atto, cr, dg, data_vigenza))}\n\nIl testo consolidato non è disponibile per questa sezione.`);
         }
@@ -810,7 +912,7 @@ server.tool(
       }
       const a1 = await fetchDettaglioArticolo(baseBody, 1, 0);
       if (a1.res.kind === "error") {
-        return bad(`Errore nel recupero dell'atto (HTTP ${a1.res.status}).`);
+        return bad(`Errore nel recupero dell'atto — ${spiegaHttp(a1.res.status)}`);
       }
       if (a1.res.kind === "empty") {
         return out(`${formatIntestazioneAtto(a1.atto, cr, dg, data_vigenza)}\n\nIl testo consolidato degli articoli non è ancora disponibile per questo atto (probabilmente molto recente). È consultabile nella Gazzetta Ufficiale indicata.`);

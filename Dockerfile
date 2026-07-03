@@ -13,12 +13,15 @@ FROM node:20-alpine
 
 WORKDIR /app
 
-# Bridge stdio <-> Streamable HTTP
-RUN npm install -g supergateway
+# Bridge stdio <-> Streamable HTTP.
+# Versione PINNATA: con "supergateway" senza versione, una release con breaking
+# change romperebbe il container al primo rebuild (build non riproducibile).
+RUN npm install -g supergateway@3.4.3
 
-# Dipendenze del server MCP
+# Dipendenze del server MCP: `npm ci` installa ESATTAMENTE il package-lock
+# (build riproducibile), mentre `npm install` può risolvere versioni diverse.
 COPY package.json package-lock.json ./
-RUN npm install
+RUN npm ci
 
 # Sorgente + build TypeScript
 COPY tsconfig.json ./
