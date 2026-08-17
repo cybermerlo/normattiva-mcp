@@ -52,6 +52,35 @@ const GET_HEADERS: Record<string, string> = {
 // Claude). 30s lascia margine anche alle risposte lente dell'API.
 const FETCH_TIMEOUT_MS = 30_000;
 
+// Budget complessivo di una singola chiamata al tool. Il timeout sopra vale per
+// UNA richiesta HTTP, ma `testo_completo` ne incatena fino a 40: senza un tetto
+// complessivo la chiamata dura quanto la somma (misurati 31-49s su L. 241/1990),
+// supera il timeout del connettore e l'utente vede un errore opaco invece del
+// testo. Meglio restituire un risultato parziale ed etichettato, in tempo utile.
+const BUDGET_TOOL_MS = 40_000;
+
+// Tetto alla dimensione di un singolo risultato. Oltre il limite di token del
+// client la risposta viene rifiutata in blocco (di nuovo: errore opaco, zero
+// contenuto). Troncare qui, dicendolo, degrada molto meglio.
+// ~80k caratteri ≈ 20k token, sotto il limite tipico di 25k token per risultato.
+const MAX_RISPOSTA_CHAR = 80_000;
+
+/**
+ * Tronca una risposta troppo grande spiegando come restringerla, invece di
+ * lasciare che il client la rifiuti per intero.
+ */
+function limitaTesto(testo: string, comeRestringere: string): string {
+  if (testo.length <= MAX_RISPOSTA_CHAR) return testo;
+  const tagliato = testo.slice(0, MAX_RISPOSTA_CHAR);
+  // Chiudi preferibilmente sull'ultimo separatore fra articoli, così l'ultimo
+  // articolo mostrato è completo e non resta un'intestazione senza testo;
+  // in mancanza, ripiega sull'ultimo a capo per non spezzare una riga a metà.
+  const separatore = tagliato.lastIndexOf("\n\n---\n");
+  const confine = separatore > MAX_RISPOSTA_CHAR * 0.8 ? separatore : tagliato.lastIndexOf("\n");
+  const corpo = confine > MAX_RISPOSTA_CHAR * 0.8 ? tagliato.slice(0, confine) : tagliato;
+  return `${corpo}\n\n---\n*⚠️ Risposta TRONCATA: superava il limite di dimensione di un singolo risultato (${MAX_RISPOSTA_CHAR} caratteri). Quanto sopra è parziale. ${comeRestringere}*`;
+}
+
 /**
  * Messaggio leggibile per gli status HTTP ricorrenti dell'API Normattiva,
  * così Claude (e l'utente) sanno cosa fare invece di vedere un codice nudo.
@@ -63,6 +92,26 @@ function spiegaHttp(status: number): string {
   if (status === 404) return "HTTP 404: risorsa non trovata su Normattiva.";
   if (status >= 500) return `HTTP ${status}: errore temporaneo dei server Normattiva. Riprova tra qualche istante.`;
   return `HTTP ${status}`;
+}
+
+/**
+ * Estrae il messaggio d'errore che l'API mette nel corpo della risposta.
+ * Senza questo si perde l'unica spiegazione utile: un HTTP 400 nudo non dice
+ * nulla, mentre il corpo riporta ad es. "Numero di atti superiore al limite
+ * consentito di 7000, raffinare la ricerca" — che indica esattamente il rimedio.
+ */
+function messaggioApi(corpo: string): string {
+  if (!corpo) return "";
+  try {
+    const j = JSON.parse(corpo);
+    const m = j?.message ?? j?.error ?? j?.descrizione;
+    if (typeof m === "string" && m.trim()) {
+      return j?.code ? `${m.trim()} (codice ${j.code})` : m.trim();
+    }
+  } catch {
+    // Corpo non JSON: usiamo comunque le prime righe, meglio di niente.
+  }
+  return corpo.slice(0, 200).replace(/\s+/g, " ").trim();
 }
 
 /**
@@ -158,8 +207,8 @@ async function apiGet(endpoint: string): Promise<unknown> {
   });
 
   if (!response.ok) {
-    await response.text().catch(() => "");
-    throw new Error(`Errore API Normattiva — ${spiegaHttp(response.status)}`);
+    const dettaglio = messaggioApi(await response.text().catch(() => ""));
+    throw new Error(`Errore API Normattiva — ${spiegaHttp(response.status)}${dettaglio ? `: ${dettaglio}` : ""}`);
   }
 
   const data = await response.json();
@@ -183,8 +232,8 @@ async function apiPost(endpoint: string, body: unknown): Promise<unknown> {
   });
 
   if (!response.ok) {
-    await response.text().catch(() => "");
-    throw new Error(`Errore API Normattiva — ${spiegaHttp(response.status)}`);
+    const dettaglio = messaggioApi(await response.text().catch(() => ""));
+    throw new Error(`Errore API Normattiva — ${spiegaHttp(response.status)}${dettaglio ? `: ${dettaglio}` : ""}`);
   }
 
   // Alcune API restituiscono testo semplice (es. token), altre JSON
@@ -222,24 +271,58 @@ function formatListaAtti(data: any): string {
     result += `\n`;
   }
 
-  // Aggiungi le facet se presenti
+  // Aggiungi le facet se presenti. Sono un ausilio alla navigazione, non il
+  // contenuto: su una ricerca ampia la sola faccetta per anno arriva a 60+ righe
+  // (più lunga dei risultati stessi), quindi mostriamo solo le più consistenti.
   if (data.facetMap) {
-    result += `\n---\n**Filtri disponibili:**\n`;
-    if (data.facetMap.codice_tipo_provvedimento) {
-      result += `\nPer tipo di atto:\n`;
-      for (const f of data.facetMap.codice_tipo_provvedimento) {
-        result += `  - ${f.descrizione || f.codice}: ${f.valore} risultati\n`;
-      }
-    }
-    if (data.facetMap.anno_provvedimento) {
-      result += `\nPer anno:\n`;
-      for (const f of data.facetMap.anno_provvedimento) {
-        result += `  - ${f.descrizione}: ${f.valore} risultati\n`;
-      }
-    }
+    const FACET_MAX = 12;
+    const blocco = (titolo: string, voci: any[] | undefined, etichetta: (f: any) => string) => {
+      if (!voci?.length) return "";
+      let s = `\n${titolo}:\n`;
+      for (const f of voci.slice(0, FACET_MAX)) s += `  - ${etichetta(f)}: ${f.valore} risultati\n`;
+      if (voci.length > FACET_MAX) s += `  - (altre ${voci.length - FACET_MAX} voci non elencate)\n`;
+      return s;
+    };
+    const facet =
+      blocco("Per tipo di atto", data.facetMap.codice_tipo_provvedimento, (f) => f.descrizione || f.codice) +
+      blocco("Per anno", data.facetMap.anno_provvedimento, (f) => f.descrizione);
+    if (facet) result += `\n---\n**Filtri disponibili:**\n${facet}`;
   }
 
   return result;
+}
+
+/**
+ * Impagina lato server una risposta già completa.
+ *
+ * Serve per /ricerca/aggiornati, che IGNORA la paginazione richiesta e
+ * restituisce sempre l'intero elenco del periodo (verificato: 170 atti in
+ * risposta a numeroElementiPerPagina=5, con numeroPagine=1). Senza questo taglio
+ * una finestra di pochi mesi produce centinaia di migliaia di caratteri — 243k
+ * su 7 mesi — che sforano il limite di dimensione di un risultato e fanno
+ * fallire l'intera chiamata.
+ *
+ * Se un domani l'endpoint rispettasse la paginazione, la lista arriverebbe già
+ * corta e la funzione non farebbe nulla.
+ */
+function impaginaLocalmente(data: any, pagina: number, perPagina: number): any {
+  const lista: any[] = Array.isArray(data?.listaAtti) ? data.listaAtti : [];
+  // L'API ha impaginato davvero solo se dichiara più di una pagina: in quel caso
+  // la lista è già la fetta giusta e ritagliarla di nuovo la falserebbe.
+  // Il test NON può essere "lista più corta di una pagina": con pochi risultati
+  // la risposta non impaginata è corta lo stesso, e una pagina fuori intervallo
+  // finirebbe per restituire in silenzio la prima.
+  if ((data?.numeroPagine ?? 1) > 1) return data;
+
+  const numeroPagine = Math.max(1, Math.ceil(lista.length / perPagina));
+  const inizio = (pagina - 1) * perPagina;
+  return {
+    ...data,
+    listaAtti: lista.slice(inizio, inizio + perPagina),
+    numeroAttiTrovati: data?.numeroAttiTrovati ?? lista.length,
+    paginaCorrente: pagina,
+    numeroPagine,
+  };
 }
 
 /**
@@ -387,29 +470,77 @@ async function fetchArticoloAuto(
 }
 
 /**
+ * Perché la scansione degli articoli si è fermata. La distinzione conta: con
+ * "fine" il testo è completo, negli altri casi è PARZIALE e vanno avvisati
+ * modello e utente — altrimenti una legge troncata a metà da un 409 anti-bot
+ * viene letta come se fosse il testo integrale.
+ */
+type MotivoStop = "fine" | "cap" | "tempo" | "errore";
+
+/**
  * Scorre gli articoli (1..cap) di una sezione dell'atto (flag) in piccoli batch,
- * fermandosi al primo articolo assente (404).
+ * fermandosi al primo articolo assente (404), allo scadere del budget di tempo
+ * o al primo errore dell'API.
  */
 async function walkArticoli(
   baseBody: Record<string, unknown>,
   flag: number,
   cap: number,
-): Promise<{ articoli: Array<{ label: string; testo: string }>; ended: boolean; atto: any }> {
+  scadenza?: number,
+): Promise<{
+  articoli: Array<{ label: string; testo: string }>;
+  motivo: MotivoStop;
+  statusErrore?: number;
+  atto: any;
+}> {
   const BATCH = 6;
   const articoli: Array<{ label: string; testo: string }> = [];
-  let ended = false;
+  let motivo: MotivoStop = "cap";
+  let statusErrore: number | undefined;
   let atto: any = null;
-  for (let start = 1; start <= cap && !ended; start += BATCH) {
+  let stop = false;
+  for (let start = 1; start <= cap && !stop; start += BATCH) {
+    // Il budget si controlla tra un batch e l'altro: lo sforamento massimo è
+    // quindi la durata di un singolo batch, non dell'intera scansione.
+    if (scadenza != null && Date.now() >= scadenza) {
+      motivo = "tempo";
+      break;
+    }
     const nums: number[] = [];
     for (let k = start; k < start + BATCH && k <= cap; k++) nums.push(k);
     const results = await Promise.all(nums.map((n) => fetchDettaglioArticolo(baseBody, n, flag)));
     for (const r of results) {
       if (r.atto && !atto) atto = r.atto;
-      if (r.res.kind !== "article") { ended = true; break; }
-      articoli.push({ label: r.res.label, testo: r.res.testo });
+      if (r.res.kind === "article") {
+        articoli.push({ label: r.res.label, testo: r.res.testo });
+        continue;
+      }
+      if (r.res.kind === "error") {
+        motivo = "errore";
+        statusErrore = r.res.status;
+      } else {
+        motivo = "fine"; // 404/empty: l'atto finisce qui
+      }
+      stop = true;
+      break;
     }
   }
-  return { articoli, ended, atto };
+  return { articoli, motivo, statusErrore, atto };
+}
+
+/**
+ * Nota da appendere al testo scansionato: dichiara esplicitamente se quanto
+ * precede è completo o parziale, e come recuperare il resto.
+ */
+function notaFineScansione(motivo: MotivoStop, cap: number, statusErrore?: number): string {
+  if (motivo === "fine") return "";
+  if (motivo === "cap") {
+    return `\n\n---\n*Testo troncato ai primi ${cap} articoli. Usa \`articolo=N\` per consultare i successivi.*`;
+  }
+  if (motivo === "tempo") {
+    return `\n\n---\n*⚠️ Recupero interrotto per limite di tempo: il testo sopra è PARZIALE. Richiedi gli articoli mancanti con \`articolo=N\`.*`;
+  }
+  return `\n\n---\n*⚠️ Recupero interrotto da un errore di Normattiva (${spiegaHttp(statusErrore ?? 0)}): il testo sopra è PARZIALE e mancano gli articoli successivi. Riprova tra qualche secondo, oppure richiedi i singoli articoli con \`articolo=N\`.*`;
 }
 
 /**
@@ -608,7 +739,7 @@ function trovaCorpoNormativo(nome: string): { corpo: CorpoNormativo } | { error:
 const server = new McpServer(
   {
     name: "normattiva",
-    version: "1.2.0",
+    version: "1.3.0",
   },
   {
     instructions: `Server MCP per la normativa italiana (banca dati ufficiale Normattiva). I testi restituiti sono nella versione vigente (multivigente), salvo diversa data_vigenza.
@@ -653,7 +784,7 @@ server.tool(
       const formatted = formatListaAtti(data);
 
       return {
-        content: [{ type: "text", text: formatted }],
+        content: [{ type: "text", text: limitaTesto(formatted, "Riduci `risultati_per_pagina` o restringi i criteri di ricerca.") }],
       };
     } catch (error) {
       return {
@@ -712,7 +843,7 @@ server.tool(
       const formatted = formatListaAtti(data);
 
       return {
-        content: [{ type: "text", text: formatted }],
+        content: [{ type: "text", text: limitaTesto(formatted, "Riduci `risultati_per_pagina` o restringi i criteri di ricerca.") }],
       };
     } catch (error) {
       return {
@@ -756,7 +887,7 @@ server.tool(
       const formatted = formatListaAtti(data);
 
       return {
-        content: [{ type: "text", text: formatted }],
+        content: [{ type: "text", text: limitaTesto(formatted, "Riduci `risultati_per_pagina` o restringi i criteri di ricerca.") }],
       };
     } catch (error) {
       return {
@@ -787,7 +918,13 @@ server.tool(
     testo_completo: z.boolean().default(false).describe("Se true, recupera tutti gli articoli dell'atto (fino a un massimo di 40). Ignorato se è specificato 'articolo'."),
   },
   async ({ nome_codice, codice_redazionale, data_gu, tipo_atto, numero, anno, articolo, estensione, allegato, data_vigenza, testo_completo }) => {
-    const out = (t: string) => ({ content: [{ type: "text" as const, text: t }] });
+    const scadenza = Date.now() + BUDGET_TOOL_MS;
+    const out = (t: string) => ({
+      content: [{
+        type: "text" as const,
+        text: limitaTesto(t, "Richiedi un articolo per volta con `articolo=N` invece di `testo_completo=true`."),
+      }],
+    });
     const bad = (t: string) => ({ content: [{ type: "text" as const, text: t }], isError: true });
     try {
       // Identificazione dell'atto: nome_codice (mappa cablata) oppure resolveAtto.
@@ -853,34 +990,44 @@ server.tool(
       if (testo_completo) {
         // Sezione fissata (nome_codice o allegato esplicito): scorri solo quella.
         if (flagFisso != null) {
-          const w = await walkArticoli(baseBody, flagFisso, CAP);
+          const w = await walkArticoli(baseBody, flagFisso, CAP, scadenza);
           if (w.articoli.length === 0) {
+            if (w.motivo === "errore") return bad(`Errore nel recupero del testo — ${spiegaHttp(w.statusErrore ?? 0)}`);
             if (w.atto) return out(`${conCorpo(formatIntestazioneAtto(w.atto, cr, dg, data_vigenza))}\n\nNessun articolo trovato nella sezione richiesta (allegato ${flagFisso}).`);
             return bad(`Nessun contenuto trovato nella sezione richiesta (allegato ${flagFisso}) per l'atto ${cr} (dataGU ${dg}).`);
           }
           const intest = conCorpo(formatIntestazioneAtto(w.atto, cr, dg, data_vigenza));
           const parts = w.articoli.map((a) => `**${a.label}**\n${a.testo}`);
           let o = `${intest}\n\n${parts.join("\n\n---\n")}`;
-          if (!w.ended) o += `\n\n---\n*Testo troncato ai primi ${CAP} articoli. Usa \`articolo=N\` per i successivi.*`;
+          o += notaFineScansione(w.motivo, CAP, w.statusErrore);
           o += `\n*Gli articoli con estensione (-bis, -ter, ...) non compaiono nello scorrimento: recuperali con articolo=N + estensione.*`;
           return out(o);
         }
-        const main = await walkArticoli(baseBody, 0, CAP);
+        const main = await walkArticoli(baseBody, 0, CAP, scadenza);
+        // Un blocco anti-bot o un 5xx sul PRIMO articolo lascerebbe la scansione a
+        // mani vuote: senza questo controllo si finirebbe nel ramo "Atto non
+        // trovato", che manda l'utente a correggere parametri in realtà corretti.
+        if (main.articoli.length === 0 && main.motivo === "errore") {
+          return bad(`Errore nel recupero del testo dell'atto ${cr} (dataGU ${dg}) — ${spiegaHttp(main.statusErrore ?? 0)}`);
+        }
         if (main.articoli.length >= 2) {
           const intest = formatIntestazioneAtto(main.atto, cr, dg, data_vigenza);
           const parts = main.articoli.map((a) => `**${a.label}**\n${a.testo}`);
           let o = `${intest}\n\n${parts.join("\n\n---\n")}`;
-          if (!main.ended) o += `\n\n---\n*Testo troncato ai primi ${CAP} articoli. Usa \`articolo=N\` per consultare gli articoli successivi.*`;
+          o += notaFineScansione(main.motivo, CAP, main.statusErrore);
           return out(o);
         }
         // ≤1 articolo nella parte articolata: il contenuto vero potrebbe essere l'allegato/testo unico
-        const alleg = await walkArticoli(baseBody, 1, CAP);
+        const alleg = await walkArticoli(baseBody, 1, CAP, scadenza);
         const atto = alleg.atto || main.atto;
+        if (alleg.articoli.length === 0 && alleg.motivo === "errore" && !atto) {
+          return bad(`Errore nel recupero del testo dell'atto ${cr} (dataGU ${dg}) — ${spiegaHttp(alleg.statusErrore ?? 0)}`);
+        }
         if (alleg.articoli.length >= 1) {
           const intest = formatIntestazioneAtto(atto, cr, dg, data_vigenza);
           const parts = alleg.articoli.map((a) => `**${a.label}**\n${a.testo}`);
           let o = `${intest}\n\n*Testo unico allegato:*\n\n${parts.join("\n\n---\n")}`;
-          if (!alleg.ended) o += `\n\n---\n*Testo troncato ai primi ${CAP} articoli. Usa \`articolo=N\` per gli articoli successivi.*`;
+          o += notaFineScansione(alleg.motivo, CAP, alleg.statusErrore);
           // Segnala eventuali allegati ulteriori (es. codice civile = allegato 2 del R.D. 262/1942).
           const succ = await fetchDettaglioArticolo(baseBody, 1, 2);
           if (succ.res.kind === "article") o += `\n*L'atto contiene ulteriori allegati: usa \`allegato=2\` (o superiore) per consultarli.*`;
@@ -888,7 +1035,12 @@ server.tool(
         }
         if (main.articoli.length === 1) {
           const intest = formatIntestazioneAtto(main.atto, cr, dg, data_vigenza);
-          return out(`${intest}\n\n---\n**${main.articoli[0].label}**\n${main.articoli[0].testo}`);
+          // Un solo articolo può voler dire "atto ad articolo unico" (motivo "fine")
+          // oppure scansione stroncata subito da un errore: va detto quale dei due.
+          return out(
+            `${intest}\n\n---\n**${main.articoli[0].label}**\n${main.articoli[0].testo}` +
+            notaFineScansione(main.motivo, CAP, main.statusErrore)
+          );
         }
         if (atto) {
           return out(`${formatIntestazioneAtto(atto, cr, dg, data_vigenza)}\n\nIl testo consolidato degli articoli non è ancora disponibile per questo atto.`);
@@ -984,7 +1136,7 @@ server.tool(
 // --------------------------------------------------------------------------
 server.tool(
   "atti_aggiornati",
-  `Recupera la lista degli atti normativi aggiornati (modificati) in un determinato periodo. Utile per monitorare le novità normative e le modifiche recenti alla legislazione. L'intervallo non può superare i 12 mesi e i risultati sono limitati a 7000 atti.`,
+  `Recupera la lista degli atti normativi aggiornati (modificati) in un determinato periodo. Utile per monitorare le novità normative e le modifiche recenti alla legislazione. L'intervallo non può superare i 12 mesi e i risultati sono limitati a 7000 atti. I periodi lunghi producono molti atti: scorri i risultati con 'pagina' invece di alzare 'risultati_per_pagina'.`,
   {
     data_inizio: z.string().describe("Data inizio periodo nel formato YYYY-MM-DD"),
     data_fine: z.string().describe("Data fine periodo nel formato YYYY-MM-DD (l'intervallo massimo consentito è 12 mesi)"),
@@ -1007,17 +1159,28 @@ server.tool(
       };
 
       const data = await apiPost("/ricerca/aggiornati", body);
-      
+
       if (typeof data === "string") {
         return { content: [{ type: "text", text: data }] };
       }
-      
+
+      // L'endpoint ignora la paginazione richiesta: la applichiamo qui.
+      const pagine = impaginaLocalmente(data, pagina, risultati_per_pagina);
+      if (pagina > 1 && (pagine?.listaAtti?.length ?? 0) === 0) {
+        return {
+          content: [{
+            type: "text",
+            text: `Pagina ${pagina} vuota: il periodo ${data_inizio} → ${data_fine} ha ${pagine?.numeroAttiTrovati ?? 0} atti, cioè ${pagine?.numeroPagine ?? 1} pagine da ${risultati_per_pagina}.`,
+          }],
+        };
+      }
+
       // Proviamo a formattare come lista atti se possibile
       try {
-        const formatted = formatListaAtti(data);
-        return { content: [{ type: "text", text: formatted }] };
+        const formatted = formatListaAtti(pagine);
+        return { content: [{ type: "text", text: limitaTesto(formatted, "Riduci `risultati_per_pagina` o accorcia il periodo.") }] };
       } catch {
-        return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
+        return { content: [{ type: "text", text: limitaTesto(JSON.stringify(pagine, null, 2), "Riduci `risultati_per_pagina`.") }] };
       }
     } catch (error) {
       return {

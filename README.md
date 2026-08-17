@@ -129,6 +129,31 @@ dettaglio_atto(tipo_atto="DECRETO LEGISLATIVO", numero=152, anno=2006, articolo=
 - `dettaglio_atto` gestisce anche i **testi unici e i codici approvati con decreto** (codice civile, penale, procedura civile/penale, c.p.a., TULPS, legge fallimentare, ecc.): i loro articoli stanno negli **allegati** dell'atto (`flagTipoArticolo` dell'API: 0 = corpo, N = allegato N-esimo) e vengono cercati automaticamente in corpo e allegati 1–3. Il **codice civile** è l'allegato 2 del R.D. 262/1942 (l'allegato 1 sono le preleggi); il **c.p.a.** è l'allegato 2 del D.Lgs. 104/2010.
 - Gli articoli con estensione (`-bis`, `-ter`, … fino a `-vicies`) si recuperano con `articolo=N` + `estensione` (campo `sottoArticolo` dell'API: 2 = bis, 3 = ter, …).
 
+### Limiti di dimensione e di tempo
+
+Un risultato troppo grande, o una chiamata troppo lunga, vengono scartati dal
+client (o dal connettore) **per intero**: l'utente vede un errore generico invece
+del contenuto. Il server previene entrambi i casi:
+
+- **Tetto di dimensione (80.000 caratteri, ~20k token).** Oltre la soglia la
+  risposta viene troncata sul confine dell'ultimo articolo completo, con una nota
+  esplicita su come restringere la richiesta.
+- **Budget di tempo (40 s per chiamata).** `testo_completo` incatena fino a 40
+  richieste HTTP: allo scadere del budget il server restituisce il testo raccolto
+  fino a quel momento, **dichiarandolo parziale**, invece di far scadere il
+  connettore.
+- **Paginazione di `atti_aggiornati` applicata dal server.** L'endpoint
+  `/ricerca/aggiornati` di Normattiva ignora la paginazione richiesta e
+  restituisce sempre l'intero periodo (una finestra di 7 mesi produce ~243.000
+  caratteri): il taglio in pagine viene fatto qui.
+- **Testo parziale sempre segnalato.** Se la scansione degli articoli si
+  interrompe per un errore dell'API (tipicamente il blocco anti-bot HTTP 409) o
+  per scadenza del tempo, l'output lo dichiara: un testo troncato non deve mai
+  sembrare integrale.
+- **Gli errori dell'API riportano il messaggio di Normattiva.** Es. `HTTP 400:
+  Numero di atti superiore al limite consentito di 7000, raffinare la ricerca
+  (codice 1502)` invece del solo codice di stato.
+
 ## Licenza
 
 Questo progetto è rilasciato come software libero. Le API di Normattiva sono un servizio pubblico dell'Istituto Poligrafico e Zecca dello Stato.

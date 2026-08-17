@@ -85,7 +85,41 @@ const CASI = [
     erroreAtteso: true,
     attendi: (t) => t.toLowerCase().includes("estensione"),
   },
+  {
+    // /ricerca/aggiornati ignora la paginazione e restituisce l'intero periodo:
+    // se il taglio lato server sparisce, una finestra di mesi torna a produrre
+    // centinaia di migliaia di caratteri e la chiamata fallisce per dimensione.
+    nome: "atti_aggiornati: paginazione applicata lato server",
+    tool: "atti_aggiornati",
+    args: { data_inizio: "2025-01-01", data_fine: "2025-01-31", risultati_per_pagina: 10, pagina: 1 },
+    attendi: (t) => {
+      const atti = [...t.matchAll(/Codice redazionale: /g)].length;
+      const piuPagine = /pagina 1 di (\d+)/.exec(t);
+      return atti === 10 && !!piuPagine && Number(piuPagine[1]) > 1;
+    },
+  },
+  {
+    // Il corpo della risposta d'errore è l'unica spiegazione utile: un "HTTP 400"
+    // nudo non dice cosa correggere. Qui l'API risponde con il codice 1503.
+    nome: "errore API: il messaggio di Normattiva viene riportato",
+    tool: "atti_aggiornati",
+    args: { data_inizio: "2025-06-01", data_fine: "2025-01-01" },
+    erroreAtteso: true,
+    attendi: (t) => t.toLowerCase().includes("precedente alla data iniziale"),
+  },
+  {
+    nome: "atti_aggiornati: pagina fuori intervallo spiegata",
+    tool: "atti_aggiornati",
+    args: { data_inizio: "2025-01-01", data_fine: "2025-01-31", risultati_per_pagina: 50, pagina: 99 },
+    attendi: (t) => t.toLowerCase().includes("vuota"),
+  },
 ];
+
+// Nessun risultato deve superare il limite di dimensione di un singolo tool
+// result: oltre quella soglia il client scarta l'intera risposta e l'utente
+// vede un errore opaco invece del contenuto.
+const MAX_RISPOSTA_CHAR = 80_000;
+const MARGINE_NOTA = 400; // la nota di troncamento appesa dal server
 
 async function main() {
   const transport = new StdioClientTransport({
@@ -124,6 +158,9 @@ async function main() {
       if (attesoErr !== isErr) {
         esito = "FAIL";
         dettaglio = `isError=${isErr}, atteso ${attesoErr}`;
+      } else if (testo.length > MAX_RISPOSTA_CHAR + MARGINE_NOTA) {
+        esito = "FAIL";
+        dettaglio = `risposta di ${testo.length} char: oltre il limite di dimensione di un tool result`;
       } else if (!caso.attendi(testo)) {
         esito = "FAIL";
         dettaglio = `contenuto inatteso: ${testo.slice(0, 140).replace(/\n/g, " ")}…`;
