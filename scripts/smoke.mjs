@@ -118,7 +118,7 @@ const CASI = [
 // Nessun risultato deve superare il limite di dimensione di un singolo tool
 // result: oltre quella soglia il client scarta l'intera risposta e l'utente
 // vede un errore opaco invece del contenuto.
-const MAX_RISPOSTA_CHAR = 80_000;
+const MAX_RISPOSTA_CHAR = Number(process.env.NORMATTIVA_MAX_RISPOSTA_CHAR) || 40_000;
 const MARGINE_NOTA = 400; // la nota di troncamento appesa dal server
 
 async function main() {

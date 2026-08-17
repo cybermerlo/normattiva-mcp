@@ -62,8 +62,19 @@ const BUDGET_TOOL_MS = 40_000;
 // Tetto alla dimensione di un singolo risultato. Oltre il limite di token del
 // client la risposta viene rifiutata in blocco (di nuovo: errore opaco, zero
 // contenuto). Troncare qui, dicendolo, degrada molto meglio.
-// ~80k caratteri ≈ 20k token, sotto il limite tipico di 25k token per risultato.
-const MAX_RISPOSTA_CHAR = 80_000;
+//
+// Il tetto è in caratteri perché è ciò che possiamo contare, ma il limite vero
+// del client è in token, e il rapporto NON è quello dell'inglese: il testo
+// giuridico italiano (accentate, sigle, richiami, righe corte) tokenizza molto
+// peggio. Misure attraverso un client con limite di 25k token per risultato:
+// 20.616 caratteri accettati, 62.295 e 65.751 RIFIUTATI — cioè meno di ~2,6
+// caratteri per token. Il default resta quindi ben sotto la soglia nota di
+// rifiuto, e si regola con NORMATTIVA_MAX_RISPOSTA_CHAR per client con limiti
+// diversi (l'errore da evitare è tarare questo valore su una stima ottimistica).
+const MAX_RISPOSTA_CHAR = (() => {
+  const v = Number(process.env.NORMATTIVA_MAX_RISPOSTA_CHAR);
+  return Number.isFinite(v) && v >= 2_000 ? Math.floor(v) : 40_000;
+})();
 
 /**
  * Tronca una risposta troppo grande spiegando come restringerla, invece di

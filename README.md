@@ -135,9 +135,17 @@ Un risultato troppo grande, o una chiamata troppo lunga, vengono scartati dal
 client (o dal connettore) **per intero**: l'utente vede un errore generico invece
 del contenuto. Il server previene entrambi i casi:
 
-- **Tetto di dimensione (80.000 caratteri, ~20k token).** Oltre la soglia la
-  risposta viene troncata sul confine dell'ultimo articolo completo, con una nota
-  esplicita su come restringere la richiesta.
+- **Tetto di dimensione (40.000 caratteri).** Oltre la soglia la risposta viene
+  troncata sul confine dell'ultimo articolo completo, con una nota esplicita su
+  come restringere la richiesta. Il tetto si regola con la variabile d'ambiente
+  `NORMATTIVA_MAX_RISPOSTA_CHAR`.
+
+  Il limite vero del client è in **token**, non in caratteri, e il testo
+  giuridico italiano tokenizza molto peggio dell'inglese: su un client con
+  limite di 25k token per risultato, 20.616 caratteri passano mentre 62.295
+  vengono rifiutati — meno di ~2,6 caratteri per token. Da qui il default
+  prudenziale: tarare questo valore su una stima ottimistica del rapporto
+  caratteri/token riporta esattamente il problema che serve a evitare.
 - **Budget di tempo (40 s per chiamata).** `testo_completo` incatena fino a 40
   richieste HTTP: allo scadere del budget il server restituisce il testo raccolto
   fino a quel momento, **dichiarandolo parziale**, invece di far scadere il
