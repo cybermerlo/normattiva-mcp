@@ -1,7 +1,8 @@
 # CI del server MCP Normattiva.
 #
-# - job "smoke" (ogni push + manuale + settimanale): build TypeScript e golden
-#   suite end-to-end via protocollo MCP contro l'API reale (~10 chiamate).
+# - job "smoke" (ogni push + manuale + settimanale): build TypeScript, test dei
+#   guasti contro un finto Normattiva locale (deterministico, senza rete) e
+#   golden suite end-to-end via protocollo MCP contro l'API reale (~10 chiamate).
 #   Intercetta sia le regressioni del codice sia il drift dell'API Normattiva.
 # - job "corpi" (solo settimanale + manuale): valida TUTTE le voci della
 #   tabella CORPI_NORMATIVI (codice redazionale + dataGU + allegato) contro
@@ -27,6 +28,7 @@ jobs:
           cache: npm
       - run: npm ci
       - run: npm run build
+      - run: npm run test-guasti
       - run: npm run smoke
 
   corpi:

@@ -162,6 +162,42 @@ del contenuto. Il server previene entrambi i casi:
   Numero di atti superiore al limite consentito di 7000, raffinare la ricerca
   (codice 1502)` invece del solo codice di stato.
 
+### Errori intermittenti di Normattiva (dal settembre 2026)
+
+Dal 17/09/2026 `/atto/dettaglio-atto` risponde a intermittenza — su oltre metà
+delle richieste, nei giorni peggiori — con un errore generico, a volte HTTP 404 e
+a volte HTTP 500:
+
+```json
+{"message":"Errore generico della chiamata, riprovare più tardi","code":"1000"}
+```
+
+Con status 404 è **identico** alla risposta per un articolo che non esiste
+(stesso corpo, stessi tempi): da solo non dice se l'articolo manca o se
+Normattiva è in errore. Tradurlo in "articolo non trovato, verifica il numero"
+porta un modello a concludere che articoli esistenti non esistono. Quindi:
+
+- **Ritentativi con backoff**: fino a 6 richieste per articolo (0,5 → 1 → 2 → 4 s,
+  con jitter) su 404/500 generici, 5xx, blocchi anti-bot, timeout e risposte 200
+  incomplete; nei log (`stderr`) ogni ritentativo è annotato.
+- **I 404 non vanno in cache** (solo le risposte 200 complete): altrimenti un
+  falso "non trovato" resta attaccato all'articolo per tutta la sessione.
+- **"Non trovato" solo con un riscontro.** Per i codici principali (Costituzione,
+  c.c., c.p., c.p.c., c.p.p.) la numerazione è nota: entro l'ultimo articolo il
+  server risponde "errore temporaneo, riprova" (l'articolo esiste; gli abrogati
+  restano, come "ARTICOLO ABROGATO"), oltre risponde "non trovato". Negli altri
+  casi controlla l'art. 1 dello stesso atto: se nemmeno quello arriva è un
+  disservizio di Normattiva, altrimenti la risposta dichiara l'ambiguità.
+- **`testo_completo`** conferma il 404 che chiude la scansione prima di
+  presentare il testo come completo, e segnala gli errori superati ritentando.
+- **`tipo_atto`** viene riportato al valore esatto che l'API vuole (`legge` →
+  `LEGGE`, `D.Lgs.` → `DECRETO LEGISLATIVO`, codici come `PLE`): scritto in
+  minuscolo la ricerca non trovava nulla. I decreti ministeriali stanno quasi
+  sempre come `DECRETO`: se `DECRETO MINISTERIALE` non trova nulla si ripiega lì.
+
+`npm run test-guasti` verifica tutto questo contro un finto Normattiva locale che
+simula i guasti (deterministico, senza rete; gira anche in CI a ogni push).
+
 ## Licenza
 
 Questo progetto è rilasciato come software libero. Le API di Normattiva sono un servizio pubblico dell'Istituto Poligrafico e Zecca dello Stato.
