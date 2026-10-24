@@ -59,7 +59,12 @@ const FETCH_TIMEOUT_MS = 30_000;
 // complessivo la chiamata dura quanto la somma (misurati 31-49s su L. 241/1990),
 // supera il timeout del connettore e l'utente vede un errore opaco invece del
 // testo. Meglio restituire un risultato parziale ed etichettato, in tempo utile.
-const BUDGET_TOOL_MS = 40_000;
+// Dentro il budget anche il timeout di ogni richiesta si accorcia a quanto resta
+// (vedi apiPostStatus). NORMATTIVA_BUDGET_MS serve solo ai test in locale.
+const BUDGET_TOOL_MS = (() => {
+  const v = Number(process.env.NORMATTIVA_BUDGET_MS);
+  return Number.isFinite(v) && v >= 1_000 ? v : 40_000;
+})();
 
 // Tetto alla dimensione di un singolo risultato. Oltre il limite di token del
 // client la risposta viene rifiutata in blocco (di nuovo: errore opaco, zero
@@ -99,8 +104,6 @@ function limitaTesto(testo: string, comeRestringere: string): string {
  * così Claude (e l'utente) sanno cosa fare invece di vedere un codice nudo.
  */
 function spiegaHttp(status: number): string {
-  if (status === 0) return "nessuna risposta da Normattiva (rete o timeout). Riprova tra qualche istante.";
-  if (status === 200) return "risposta incompleta da Normattiva (errore temporaneo). Riprova tra qualche istante.";
   if (status === 409 || status === 429) {
     return `HTTP ${status}: richiesta bloccata temporaneamente dai sistemi di protezione di Normattiva (anti-bot/rate limit). Attendi qualche secondo e riprova, evitando richieste massive ravvicinate.`;
   }
@@ -369,7 +372,7 @@ function htmlToText(html: string): string {
 }
 
 // ============================================================================
-// ERRORE GENERICO DI NORMATTIVA E RITENTATIVI
+// ESITI DELL'API: CLASSIFICAZIONE E RITENTATIVI
 // ============================================================================
 //
 // ⚠️ Dal 2026-09-17 l'endpoint /atto/dettaglio-atto sbaglia a intermittenza su
@@ -379,19 +382,26 @@ function htmlToText(html: string): string {
 //     {"message":"Errore generico della chiamata, riprovare più tardi","code":"1000"}
 // e arriva in ~6 ms lato server (una risposta vera ne richiede ~120). Per lo
 // stesso articolo lo status (404 o 500) cambia a caso da una chiamata all'altra.
-// E soprattutto: per un articolo che NON esiste l'API risponde ESATTAMENTE così
-// (404, stesso corpo, stessi ~6 ms: provato su art. 2043 c.c. e art. 2999 c.c.,
-// che non esiste). Un 404 con questo corpo quindi NON prova che l'articolo manchi.
-// Prima di questa correzione il server lo traduceva in "Articolo N non trovato...
-// Verifica il numero" — e lo teneva pure in cache per 6 ore — così un modello
-// concludeva che articoli come il 1218 o il 2697 c.c. non esistono.
-// Rimedio: il 404 "generico" si ritenta con backoff; se persiste si cerca un
-// riscontro prima di rispondere (vedi dettaglio_atto, caso 1), e in mancanza si
-// dice che Normattiva è in errore, mai "verifica il numero".
+// Il server traduceva quel 404 in "Articolo N non trovato... Verifica il numero"
+// (e lo teneva in cache per 6 ore): un modello concludeva che articoli come il
+// 1218 o il 2697 c.c. non esistono.
+//
+// Il corpo del 404 però distingue i casi (verificato sull'API il 2026-10-24):
+//  - articolo o allegato inesistente: un messaggio che ripete la richiesta, es.
+//    {"message":"dataPubblicazioneGazzetta:... idArticolo:2999 ... flagTipoArticolo:2","code":null};
+//  - codice redazionale e data GU che non individuano un atto (es. la data
+//    dell'atto al posto di quella della Gazzetta): {"message":"Atto non trovato"};
+//  - il guasto: il corpo generico qui sopra, che non dice nulla sull'articolo.
+// Lo stesso corpo generico arriva, con HTTP 500, anche per una data malformata
+// (es. dataVigenza "2020/01/01"): per questo le date si controllano prima, negli
+// schemi dei tool (vedi dataApi). Ogni risposta si classifica una volta sola,
+// qui, e si ritenta solo ciò che ritentando può cambiare.
 
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
-// Base del backoff esponenziale: 0,5 s → 1 → 2 → 4 (tetto), ±25% di jitter.
+// Base del backoff esponenziale: 0,5 s → 1 → 2 (tetto), ±25% di jitter. Gli
+// errori del guasto sono indipendenti da una richiesta all'altra: attese più
+// lunghe non li fanno sparire prima, consumano solo il budget di tempo.
 // NORMATTIVA_BACKOFF_MS serve solo ai test in locale, per non aspettare.
 const BACKOFF_BASE_MS = (() => {
   const v = Number(process.env.NORMATTIVA_BACKOFF_MS);
@@ -400,10 +410,14 @@ const BACKOFF_BASE_MS = (() => {
 
 /** Pausa prima del tentativo n+1. Più lunga dopo un blocco anti-bot (409/429). */
 function attesaBackoff(n: number, status: number): number {
-  const base = Math.min(BACKOFF_BASE_MS * 2 ** (n - 1), BACKOFF_BASE_MS * 8);
+  const base = Math.min(BACKOFF_BASE_MS * 2 ** (n - 1), BACKOFF_BASE_MS * 4);
   const minimo = status === 409 || status === 429 ? BACKOFF_BASE_MS * 4 : 0;
   return Math.round(Math.max(base, minimo) * (0.75 + Math.random() * 0.5));
 }
+
+// Sotto questo margine dalla scadenza non si avvia un'altra richiesta: non
+// farebbe in tempo a rispondere.
+const MIN_RICHIESTA_MS = 500;
 
 /** Riconosce il corpo dell'errore generico dell'API (vedi sopra). */
 function erroreGenerico(data: any): boolean {
@@ -413,46 +427,65 @@ function erroreGenerico(data: any): boolean {
 }
 
 /**
+ * Classe di una risposta dell'API (vedi sopra):
+ *  - "ok": 200 completo;
+ *  - "assente": 404 con un messaggio sull'articolo richiesto: l'articolo (o
+ *    l'allegato) non c'è. Definitivo;
+ *  - "atto": 404 «Atto non trovato»: codice redazionale e data GU non
+ *    individuano un atto. Definitivo;
+ *  - "transitorio": errore generico (404 o 500), altri 5xx, rete, timeout, 200
+ *    incompleto (es. pagina HTML), 404 dal corpo illeggibile: può sparire
+ *    ritentando, e non dice nulla sull'esistenza del testo;
+ *  - "bloccato": 409/429 dell'anti-bot, che colpisce tutto il server: un solo
+ *    ritentativo, poi ci si ferma (insistere prolunga il blocco);
+ *  - "permanente": 400 e simili, 500 con un messaggio specifico (es. parametri
+ *    errati): ritentare non cambia l'esito.
+ */
+type Classe = "ok" | "assente" | "atto" | "transitorio" | "bloccato" | "permanente";
+
+function classifica(endpoint: string, status: number, data: any): Classe {
+  if (status === 200) {
+    const completa = data != null && typeof data === "object" && !erroreGenerico(data) &&
+      (!endpoint.startsWith("/atto/dettaglio-atto") || data?.data?.atto != null);
+    return completa ? "ok" : "transitorio";
+  }
+  if (status === 409 || status === 429) return "bloccato";
+  if (status === 0 || status > 500) return "transitorio";
+  const msg = data != null && typeof data === "object" ? String(data.message ?? "").trim() : "";
+  if (status === 404) {
+    if (/^atto non trovato/i.test(msg)) return "atto";
+    // Solo un messaggio che riguarda l'articolo prova che manca: il corpo
+    // generico, o uno sconosciuto (es. la pagina HTML di un gateway), no.
+    return /articolo/i.test(msg) && !erroreGenerico(data) ? "assente" : "transitorio";
+  }
+  if (status === 500) return erroreGenerico(data) || !msg ? "transitorio" : "permanente";
+  return "permanente";
+}
+
+/**
  * Esito di una POST verso l'API. `status` 0 = nessuna risposta (rete/timeout).
- * `incompleta` = 200 ma senza il contenuto atteso (corpo non JSON, pagina
- * d'errore HTML, `data.atto` assente): si tratta come un errore transitorio.
+ * `scaduto` = i ritentativi si sono fermati per il budget di tempo, quindi
+ * l'esito non è definitivo.
  */
 type EsitoApi = {
   status: number;
   data: any;
-  generico: boolean;
-  incompleta: boolean;
+  classe: Classe;
   tentativi: number;
+  scaduto?: boolean;
 };
 
 type OpzioniRetry = {
   /** Richieste massime (default 3). */
   tentativi?: number;
-  /** Ritenta anche il 404 col corpo "generico", che è ambiguo (vedi sopra). */
-  ritenta404?: boolean;
-  /** Timestamp oltre il quale non si avviano altri tentativi. */
+  /** Timestamp oltre il quale non si avviano altre richieste. */
   scadenza?: number;
 };
 
-/** Errore che può sparire ritentando (a differenza di un 400 o di un 404 vero). */
-function transitorio(status: number, generico: boolean, data: any): boolean {
-  if (status === 0 || status === 409 || status === 429 || status > 500) return true;
-  // 500 col corpo generico = il guasto descritto sopra; un 500 con un messaggio
-  // specifico (es. parametri errati) invece non cambia ritentando.
-  if (status === 500) return generico || data == null || typeof data !== "object";
-  return false;
-}
-
-function daRitentare(e: EsitoApi, ritenta404: boolean): boolean {
-  if (e.status === 200) return e.incompleta;
-  if (e.status === 404) return ritenta404 && e.generico;
-  return transitorio(e.status, e.generico, e.data);
-}
-
 /** Una sola POST, senza ritentativi. Non lancia eccezioni. */
-async function postUnaVolta(endpoint: string, body: unknown): Promise<Omit<EsitoApi, "tentativi">> {
+async function postUnaVolta(endpoint: string, body: unknown, timeoutMs: number): Promise<Omit<EsitoApi, "tentativi">> {
   const ctrl = new AbortController();
-  const timer = setTimeout(() => ctrl.abort(), FETCH_TIMEOUT_MS);
+  const timer = setTimeout(() => ctrl.abort(), timeoutMs);
   try {
     const response = await fetch(`${API_BASE}${endpoint}`, {
       method: "POST",
@@ -467,70 +500,120 @@ async function postUnaVolta(endpoint: string, body: unknown): Promise<Omit<Esito
     } catch {
       // corpo non JSON (es. pagina d'errore HTML): resta testo
     }
-    const incompleta =
-      response.status === 200 &&
-      (data == null || typeof data !== "object" ||
-        (endpoint.startsWith("/atto/dettaglio-atto") && !data?.data?.atto));
-    return { status: response.status, data, generico: erroreGenerico(data), incompleta };
+    return { status: response.status, data, classe: classifica(endpoint, response.status, data) };
   } catch (e) {
+    const entro = timeoutMs >= 1_000 ? `${Math.round(timeoutMs / 1_000)} s` : `${timeoutMs} ms`;
     const msg = (e as Error)?.name === "AbortError"
-      ? `nessuna risposta entro ${FETCH_TIMEOUT_MS / 1000}s (timeout)`
+      ? `nessuna risposta entro ${entro} (timeout)`
       : `errore di rete: ${(e as Error)?.message ?? String(e)}`;
-    return { status: 0, data: msg, generico: false, incompleta: false };
+    return { status: 0, data: msg, classe: "transitorio" };
   } finally {
     clearTimeout(timer);
   }
 }
 
 /** Descrizione breve di un esito d'errore, per log e messaggi. */
-function descriviEsito(e: { status: number; data: any; incompleta?: boolean }): string {
+function descriviEsito(e: { status: number; data: any }): string {
   if (e.status === 0) return String(e.data);
-  if (e.incompleta) return `HTTP ${e.status} con risposta incompleta`;
-  const msg = messaggioApi(typeof e.data === "string" ? e.data : JSON.stringify(e.data ?? ""));
+  if (e.status === 200 && !erroreGenerico(e.data)) return "HTTP 200 con risposta incompleta";
+  const corpo = e.data == null ? "" : typeof e.data === "string" ? e.data : JSON.stringify(e.data);
+  const msg = messaggioApi(corpo);
   return `HTTP ${e.status}${msg ? ` «${msg}»` : ""}`;
 }
 
 /**
- * POST che restituisce l'esito senza lanciare eccezioni, per poter distinguere
- * articolo, 404 ed errore; ritenta con backoff gli errori transitori (e, se
- * richiesto, il 404 generico). Si cacheano SOLO le risposte 200 complete, mai i
- * 404: con questa API un 404 può essere il guasto (vedi sopra) e, cacheato,
- * restava attaccato all'articolo per 6 ore in quella sessione — vanificando
- * anche i ritentativi di chi richiamava il tool (il check del monitor lo faceva:
- * i tentativi 2 e 3 tornavano "non trovato" in 0-4 ms, dalla cache).
+ * POST che restituisce l'esito classificato senza lanciare eccezioni. Ritenta
+ * con backoff gli esiti "transitorio" (fino a `tentativi` richieste) e, una
+ * volta sola, "bloccato". Con `scadenza` non avvia richieste oltre il budget e
+ * accorcia il timeout di ciascuna al tempo che resta.
+ * Si cacheano SOLO le risposte 200 complete: un errore in cache restava
+ * attaccato all'articolo per 6 ore in quella sessione, vanificando anche i
+ * ritentativi di chi richiamava il tool (il check del monitor lo faceva: i
+ * tentativi 2 e 3 tornavano "non trovato" in 0-4 ms, dalla cache).
  */
 async function apiPostStatus(endpoint: string, body: unknown, opz: OpzioniRetry = {}): Promise<EsitoApi> {
   const key = `POSTS ${endpoint} ${JSON.stringify(body)}`;
   const hit = cacheGet(key) as EsitoApi | undefined;
-  // dalla cache nessun tentativo è fallito: non va ricontato come anomalia
+  // dalla cache nessun tentativo è fallito
   if (hit !== undefined) return { ...hit, tentativi: 1 };
 
   const max = Math.max(1, opz.tentativi ?? 3);
-  let esito: EsitoApi = { status: 0, data: null, generico: false, incompleta: false, tentativi: 0 };
+  const log = (e: EsitoApi, coda: string) =>
+    console.error(`[Normattiva MCP] ${endpoint} ${JSON.stringify(body)}: ${descriviEsito(e)} — ${coda}`);
+  // Esito se il budget è finito prima ancora di cominciare.
+  let esito: EsitoApi = { status: 0, data: "tempo a disposizione esaurito", classe: "transitorio", tentativi: 0, scaduto: true };
   for (let n = 1; n <= max; n++) {
-    esito = { ...(await postUnaVolta(endpoint, body)), tentativi: n };
-    if (!daRitentare(esito, opz.ritenta404 === true)) break;
-    const pausa = attesaBackoff(n, esito.status);
-    const tempo = opz.scadenza == null || Date.now() + pausa < opz.scadenza;
-    if (n === max || !tempo) {
-      if (max > 1) console.error(`[Normattiva MCP] ${endpoint} ${JSON.stringify(body)}: ${descriviEsito(esito)} — tentativi esauriti (${n}/${max}${tempo ? "" : ", budget di tempo"})`);
+    const resto = opz.scadenza == null ? FETCH_TIMEOUT_MS : opz.scadenza - Date.now();
+    if (resto < MIN_RICHIESTA_MS) {
+      esito = { ...esito, scaduto: true };
       break;
     }
-    console.error(`[Normattiva MCP] ${endpoint} ${JSON.stringify(body)}: ${descriviEsito(esito)} — tentativo ${n}/${max}, riprovo fra ${pausa} ms`);
+    esito = { ...(await postUnaVolta(endpoint, body, Math.min(FETCH_TIMEOUT_MS, resto))), tentativi: n };
+    if (esito.classe !== "transitorio" && esito.classe !== "bloccato") break;
+    const limite = esito.classe === "bloccato" ? Math.min(max, 2) : max;
+    if (n >= limite) {
+      if (max > 1) log(esito, `tentativi esauriti (${n}/${limite})`);
+      break;
+    }
+    const pausa = attesaBackoff(n, esito.status);
+    if (opz.scadenza != null && Date.now() + pausa + MIN_RICHIESTA_MS > opz.scadenza) {
+      esito.scaduto = true;
+      log(esito, `tentativo ${n}/${limite}, tempo esaurito`);
+      break;
+    }
+    log(esito, `tentativo ${n}/${limite}, riprovo fra ${pausa} ms`);
     await sleep(pausa);
   }
-  if (esito.status === 200 && !esito.incompleta) cacheSet(key, esito, cacheTtlFor(endpoint));
+  if (esito.classe === "ok") cacheSet(key, esito, cacheTtlFor(endpoint));
   return esito;
+}
+
+/** Recupero non riuscito, con la classe che decide cosa dire e se insistere. */
+type ErroreApi = {
+  classe: "transitorio" | "bloccato" | "permanente";
+  status: number;
+  dettaglio: string;
+  tentativi: number;
+  scaduto?: boolean;
+};
+
+/** Il budget di tempo è finito prima di poter interrogare Normattiva. */
+const TEMPO_ESAURITO: ErroreApi = { classe: "transitorio", status: 0, dettaglio: "tempo a disposizione esaurito", tentativi: 0, scaduto: true };
+
+/** Esito non riuscito come ErroreApi ("assente" e "atto", fuori dal loro contesto, sono permanenti). */
+function comeErrore(e: EsitoApi): ErroreApi {
+  const classe = e.classe === "transitorio" || e.classe === "bloccato" ? e.classe : "permanente";
+  return { classe, status: e.status, dettaglio: descriviEsito(e), tentativi: e.tentativi, scaduto: e.scaduto };
+}
+
+/**
+ * Messaggio per un recupero non riuscito, secondo la classe dell'errore: chi
+ * legge deve capire se riprovare, aspettare o correggere la richiesta, e che un
+ * errore di Normattiva non dice nulla sull'esistenza del testo. `fallito` è la
+ * frase su cosa non è riuscito; `esistenza` sostituisce quella standard.
+ */
+function spiegaErrore(e: ErroreApi, fallito: string, esistenza = "NON indica che il testo non esista."): string {
+  if (e.classe === "bloccato") {
+    return `⚠️ Normattiva sta bloccando temporaneamente le richieste di questo server (${e.dettaglio}, protezione anti-bot): ${fallito}. ${esistenza} Attendi almeno mezzo minuto prima di riprovare ed evita richieste ravvicinate o in parallelo; se il blocco persiste, dichiara all'utente che il testo non è stato recuperato, senza citarlo a memoria.`;
+  }
+  if (e.classe === "permanente") {
+    return `Errore di Normattiva (${e.dettaglio}): ${fallito}. Ritentare non cambia l'esito: verifica i parametri della richiesta.`;
+  }
+  if (e.tentativi === 0) {
+    return `⚠️ Tempo esaurito: ${fallito}, perché le richieste precedenti a Normattiva hanno occupato tutto il tempo a disposizione. ${esistenza} Riprova.`;
+  }
+  const quanti = `dopo ${e.tentativi} ${e.tentativi === 1 ? "tentativo" : "tentativi"}${e.scaduto ? ", poi il tempo a disposizione è finito" : ""}`;
+  return `⚠️ Errore temporaneo di Normattiva: ${fallito} (${e.dettaglio}, ${quanti}). ${esistenza} Riprova tra qualche secondo: gli errori di Normattiva sono intermittenti e un nuovo tentativo spesso riesce. Se l'errore persiste, dichiara all'utente che il testo non è stato recuperato, senza citarlo a memoria.`;
 }
 
 type ArticoloResult =
   | { kind: "article"; label: string; testo: string; tentativi: number }
   | { kind: "empty"; tentativi: number }
-  // 404 persistente. ⚠️ AMBIGUO: l'API risponde così sia per un articolo che non
-  // esiste sia per il proprio errore generico (vedi sopra). Non va presentato
-  // come prova che l'articolo manchi senza un riscontro.
-  | { kind: "notfound"; tentativi: number }
-  | { kind: "error"; status: number; generico: boolean; dettaglio: string; tentativi: number };
+  // L'articolo (o la sezione) non c'è: 404 specifico, vedi classifica.
+  | { kind: "assente"; tentativi: number }
+  // Codice redazionale e data GU non individuano un atto.
+  | { kind: "atto"; tentativi: number }
+  | ({ kind: "error" } & ErroreApi);
 
 /**
  * Estrae etichetta e testo di un articolo dall'HTML restituito dall'API.
@@ -578,10 +661,8 @@ async function fetchDettaglioArticolo(
   if (flag != null) body.flagTipoArticolo = flag;
   if (sottoArticolo != null) body.sottoArticolo = sottoArticolo;
   const e = await apiPostStatus("/atto/dettaglio-atto", body, opz);
-  if (e.status === 404) return { res: { kind: "notfound", tentativi: e.tentativi }, atto: null };
-  if (e.status !== 200 || e.incompleta) {
-    return { res: { kind: "error", status: e.status, generico: e.generico, dettaglio: descriviEsito(e), tentativi: e.tentativi }, atto: null };
-  }
+  if (e.classe === "assente" || e.classe === "atto") return { res: { kind: e.classe, tentativi: e.tentativi }, atto: null };
+  if (e.classe !== "ok") return { res: { kind: "error", ...comeErrore(e) }, atto: null };
 
   const atto = e.data?.data?.atto ?? null;
   const ex = extractArticolo(atto?.articoloHtml ?? "", idArticolo);
@@ -593,157 +674,196 @@ async function fetchDettaglioArticolo(
 // (55-70% di errori, indipendenti da una richiesta all'altra: il 18/09 l'art.
 // 734 c.p. ha dato 4 falsi 404 di fila e poi 200) 6 richieste falliscono tutte
 // in ~3-10 casi su 100 invece di 55-70; con l'API sana basta la prima. Nel caso
-// peggiore sono ~12 s di attese (fino a ~15 col jitter), dentro BUDGET_TOOL_MS.
+// peggiore sono ~7,5 s di attese (fino a ~9,5 col jitter), dentro BUDGET_TOOL_MS.
 const TENTATIVI_ARTICOLO = 6;
 
 /**
- * Recupera un articolo cercandolo nel corpo dell'atto (flag 0) e poi, se assente,
- * negli allegati (flag 1..3). Necessario per i decreti che "approvano" codici e
- * testi unici, dove gli articoli sostanziali stanno in un allegato (es. codice
- * civile = allegato 2 del R.D. 262/1942, c.p.a. = allegato 2 del D.Lgs. 104/2010).
+ * Recupera un articolo cercandolo nel corpo dell'atto (flag 0) e poi negli
+ * allegati (flag 1..3). Necessario per i decreti che "approvano" codici e testi
+ * unici, dove gli articoli sostanziali stanno in un allegato (es. codice civile =
+ * allegato 2 del R.D. 262/1942, c.p.a. = allegato 2 del D.Lgs. 104/2010).
  * Con `flagFisso` la ricerca è limitata a quella sola sezione.
  *
- * Ritentativi: con la sezione fissa li fa apiPostStatus, anche sul 404 generico.
- * Esplorando le sezioni invece un 404 è spesso GENUINO (l'articolo sta in un
- * altro allegato), quindi non si insiste sulla singola sezione: si ripetono i
- * giri, con backoff fra l'uno e l'altro, alternando il giro completo a quello
- * sul solo corpo dell'atto (dove sta l'articolo negli atti ordinari: i codici
- * negli allegati passano di norma da nome_codice, a sezione fissa). Così, a
- * Normattiva in errore, sono 15 richieste invece di 24 per un articolo.
+ * Vale la prima sezione, nell'ordine, che ha l'articolo: si passa alla
+ * successiva solo quando in questa di sicuro non c'è ("assente"). Un errore,
+ * anche dopo i ritentativi, chiude la ricerca: l'articolo poteva stare proprio
+ * nella sezione in errore, e un allegato può avere un articolo con lo stesso
+ * numero (es. il trattato allegato a una legge di ratifica), che verrebbe
+ * restituito al posto di quello chiesto.
  */
 async function fetchArticoloAuto(
   baseBody: Record<string, unknown>,
   idArticolo: number,
   sottoArticolo?: number,
   flagFisso?: number,
-  opz: { tentativi?: number; scadenza?: number } = {},
+  opz: OpzioniRetry = {},
 ): Promise<{ res: ArticoloResult; atto: any; flagUsato: number }> {
-  const giri = opz.tentativi ?? TENTATIVI_ARTICOLO;
+  const tentativi: OpzioniRetry = { tentativi: opz.tentativi ?? TENTATIVI_ARTICOLO, scadenza: opz.scadenza };
   if (flagFisso != null) {
-    const r = await fetchDettaglioArticolo(baseBody, idArticolo, flagFisso, sottoArticolo, { tentativi: giri, ritenta404: true, scadenza: opz.scadenza });
-    return { ...r, flagUsato: flagFisso };
+    return { ...(await fetchDettaglioArticolo(baseBody, idArticolo, flagFisso, sottoArticolo, tentativi)), flagUsato: flagFisso };
   }
-  let ultimo: { res: ArticoloResult; atto: any; flagUsato: number } = { res: { kind: "notfound", tentativi: 0 }, atto: null, flagUsato: 3 };
-  for (let giro = 1; giro <= giri; giro++) {
-    const flags = giro % 2 === 1 ? [0, 1, 2, 3] : [0];
-    let errore: { res: ArticoloResult; atto: any; flagUsato: number } | null = null;
-    let statusUltimo = 404;
-    for (const f of flags) {
-      const r = await fetchDettaglioArticolo(baseBody, idArticolo, f, sottoArticolo, { tentativi: 1 });
-      if (r.res.kind === "article") return { ...r, res: { ...r.res, tentativi: giro }, flagUsato: f };
-      // "empty" nel corpo (atto recente senza testo consolidato): inutile scandagliare gli allegati.
-      if (r.res.kind === "empty" && f === 0) return { ...r, flagUsato: f };
-      if (r.res.kind === "error") {
-        // Un errore non transitorio (es. 400: parametri errati) non cambia ritentando.
-        if (!transitorio(r.res.status, r.res.generico, null) && r.res.status !== 200) return { ...r, flagUsato: f };
-        errore = { ...r, flagUsato: f };
-        statusUltimo = r.res.status;
-      }
-    }
-    // Se in questo giro c'è stato un errore transitorio l'esito è quello (non
-    // "non trovato"): l'articolo poteva stare proprio nella sezione in errore.
-    ultimo = errore
-      ? { ...errore, res: { ...(errore.res as Extract<ArticoloResult, { kind: "error" }>), tentativi: giro } }
-      : { res: { kind: "notfound", tentativi: giro }, atto: null, flagUsato: flags[flags.length - 1] };
-    if (giro === giri) break;
-    const pausa = attesaBackoff(giro, statusUltimo);
-    if (opz.scadenza != null && Date.now() + pausa >= opz.scadenza) break;
-    console.error(`[Normattiva MCP] articolo ${idArticolo}${sottoArticolo ? `/${sottoArticolo}` : ""} non restituito da nessuna sezione (giro ${giro}/${giri}), riprovo fra ${pausa} ms`);
-    await sleep(pausa);
+  for (const f of [0, 1, 2, 3]) {
+    const r = await fetchDettaglioArticolo(baseBody, idArticolo, f, sottoArticolo, tentativi);
+    // "empty" nel corpo (atto recente senza testo consolidato) chiude la ricerca;
+    // in un allegato (es. una tabella, senza articoli) no.
+    if (r.res.kind !== "assente" && !(r.res.kind === "empty" && f > 0)) return { ...r, flagUsato: f };
   }
-  return ultimo;
+  return { res: { kind: "assente", tentativi: 1 }, atto: null, flagUsato: 3 };
 }
 
 /**
  * Perché la scansione degli articoli si è fermata. La distinzione conta: con
- * "fine" il testo è completo, negli altri casi è PARZIALE e vanno avvisati
- * modello e utente — altrimenti una legge troncata a metà da un 409 anti-bot
- * viene letta come se fosse il testo integrale.
+ * "fine" il testo arriva all'ultimo articolo dell'atto, negli altri casi è
+ * PARZIALE e vanno avvisati modello e utente — altrimenti una legge troncata a
+ * metà da un 409 anti-bot viene letta come se fosse il testo integrale.
+ * "atto": Normattiva non riconosce l'atto (nessun articolo letto).
  */
-type MotivoStop = "fine" | "cap" | "tempo" | "errore";
+type MotivoStop = "fine" | "cap" | "tempo" | "errore" | "atto";
+
+type Scansione = {
+  articoli: Array<{ n: number; label: string; testo: string }>;
+  motivo: MotivoStop;
+  /** Articoli non restituiti nemmeno ritentando: NON vuol dire che manchino. */
+  mancanti: number[];
+  /** L'errore che ha lasciato fuori articoli o fermato la scansione. */
+  errore?: ErroreApi;
+  atto: any;
+};
+
+// Tentativi per articolo nella scansione: meno che per un articolo singolo,
+// perché un gruppo di articoli in parallelo dura quanto il più lento; chi resta
+// senza risposta riceve un secondo giro di tentativi alla fine.
+const TENTATIVI_SCANSIONE = 4;
 
 /**
- * Scorre gli articoli (1..cap) di una sezione dell'atto (flag) in piccoli batch,
- * fermandosi al primo articolo assente (404), allo scadere del budget di tempo
- * o al primo errore dell'API.
+ * Articoli mancanti DENTRO il testo restituito. Se la scansione si è interrotta,
+ * quelli dopo l'ultimo articolo letto li copre la nota d'interruzione.
+ */
+function lacune(w: Scansione): number[] {
+  if (w.motivo === "fine" || w.motivo === "cap") return w.mancanti;
+  const ultimo = w.articoli.length ? w.articoli[w.articoli.length - 1].n : 0;
+  return w.mancanti.filter((n) => n < ultimo);
+}
+
+/**
+ * Scorre gli articoli (1..cap) di una sezione dell'atto (flag) a gruppi
+ * paralleli. L'atto finisce al primo articolo che di sicuro non c'è (404
+ * specifico o testo vuoto), salvo che esista un articolo successivo dello
+ * stesso gruppo. Un articolo in errore anche dopo i ritentativi NON chiude
+ * l'atto: finisce fra i `mancanti` e la scansione prosegue. Ci si ferma invece
+ * al blocco anti-bot, allo scadere del budget di tempo e quando un intero
+ * gruppo fallisce (Normattiva è giù: inutile insistere).
  */
 async function walkArticoli(
   baseBody: Record<string, unknown>,
   flag: number,
   cap: number,
   scadenza?: number,
-): Promise<{
-  articoli: Array<{ label: string; testo: string }>;
-  motivo: MotivoStop;
-  statusErrore?: number;
-  atto: any;
-  anomalie: number;
-}> {
-  const BATCH = 6;
-  const articoli: Array<{ label: string; testo: string }> = [];
-  let motivo: MotivoStop = "cap";
-  let statusErrore: number | undefined;
-  let atto: any = null;
-  let stop = false;
-  // Errori di Normattiva superati ritentando: se ce ne sono stati, anche la
-  // "fine" dell'atto va dichiarata con cautela (vedi notaFineScansione).
-  let anomalie = 0;
-  for (let start = 1; start <= cap && !stop; start += BATCH) {
-    // Il budget si controlla tra un batch e l'altro: lo sforamento massimo è
-    // quindi la durata di un singolo batch, non dell'intera scansione.
+): Promise<Scansione> {
+  const GRUPPO = 6;
+  const w: Scansione = { articoli: [], motivo: "cap", mancanti: [], atto: null };
+  const opz: OpzioniRetry = { tentativi: TENTATIVI_SCANSIONE, scadenza };
+  // Un blocco anti-bot resta l'errore da riportare: è quello che ferma tutto.
+  const annota = (e: ErroreApi) => {
+    if (w.errore?.classe !== "bloccato") w.errore = e;
+  };
+  scansione: for (let start = 1; start <= cap; start += GRUPPO) {
+    // Il budget si controlla fra un gruppo e l'altro (e, dentro, a ogni richiesta).
     if (scadenza != null && Date.now() >= scadenza) {
-      motivo = "tempo";
+      w.motivo = "tempo";
       break;
     }
     const nums: number[] = [];
-    for (let k = start; k < start + BATCH && k <= cap; k++) nums.push(k);
-    const results = await Promise.all(nums.map((n) => fetchDettaglioArticolo(baseBody, n, flag, undefined, { tentativi: 3, scadenza })));
+    for (let k = start; k < start + GRUPPO && k <= cap; k++) nums.push(k);
+    const results = await Promise.all(nums.map((n) => fetchDettaglioArticolo(baseBody, n, flag, undefined, opz)));
+    let stop: MotivoStop | null = null;
+    let certi = 0; // esiti certi: articolo letto, o di sicuro assente
     for (let i = 0; i < results.length; i++) {
-      let r = results[i];
-      anomalie += r.res.tentativi - 1;
-      if (r.res.kind === "notfound") {
-        // Il 404 dovrebbe voler dire "l'atto finisce qui", ma può essere l'errore
-        // generico di Normattiva (vedi erroreGenerico): senza conferma un atto
-        // veniva troncato a metà e presentato come COMPLETO. Si conferma con
-        // qualche ritentativo, uno solo per scansione (è sequenziale).
-        const conferma = await fetchDettaglioArticolo(baseBody, nums[i], flag, undefined, { tentativi: TENTATIVI_ARTICOLO - 1, ritenta404: true, scadenza });
-        anomalie += conferma.res.kind === "notfound" ? 0 : conferma.res.tentativi;
-        r = conferma;
-      }
-      if (r.atto && !atto) atto = r.atto;
-      if (r.res.kind === "article") {
-        articoli.push({ label: r.res.label, testo: r.res.testo });
-        continue;
-      }
-      if (r.res.kind === "error") {
-        motivo = "errore";
-        statusErrore = r.res.status;
+      const { res, atto } = results[i];
+      if (atto && !w.atto) w.atto = atto;
+      if (res.kind === "article") {
+        w.articoli.push({ n: nums[i], label: res.label, testo: res.testo });
+        certi++;
+      } else if (res.kind === "error") {
+        w.mancanti.push(nums[i]);
+        annota(res);
+        if (res.classe === "bloccato") stop = "errore";
+        else if (res.scaduto && !stop) stop = "tempo";
+      } else if (res.kind === "atto") {
+        // Atto non riconosciuto: se non si è letto nulla, il riferimento è sbagliato.
+        if (w.articoli.length === 0 && w.mancanti.length === 0) {
+          w.motivo = "atto";
+          break scansione;
+        }
+        w.mancanti.push(nums[i]);
+        annota({ classe: "permanente", status: 404, dettaglio: "HTTP 404 «Atto non trovato»", tentativi: res.tentativi });
       } else {
-        motivo = "fine"; // 404 confermato / empty: l'atto finisce qui
+        // "assente" o "empty": qui l'atto finisce, salvo un buco nella numerazione.
+        certi++;
+        if (results.slice(i + 1).some((r) => r.res.kind === "article")) continue;
+        w.motivo = "fine";
+        break scansione;
       }
-      stop = true;
+    }
+    if (stop) {
+      w.motivo = stop;
+      break;
+    }
+    if (certi === 0) {
+      w.motivo = "errore";
       break;
     }
   }
-  return { articoli, motivo, statusErrore, atto, anomalie };
+
+  // Secondo giro per gli articoli rimasti indietro, se c'è tempo e Normattiva
+  // non sta bloccando le richieste.
+  const daRiprovare = lacune(w);
+  if (daRiprovare.length && w.errore?.classe !== "bloccato") {
+    for (let i = 0; i < daRiprovare.length; i += GRUPPO) {
+      if (scadenza != null && Date.now() >= scadenza) break;
+      const gruppo = daRiprovare.slice(i, i + GRUPPO);
+      const rs = await Promise.all(gruppo.map((n) => fetchDettaglioArticolo(baseBody, n, flag, undefined, opz)));
+      rs.forEach(({ res, atto }, j) => {
+        if (atto && !w.atto) w.atto = atto;
+        if (res.kind === "error" || res.kind === "atto") return;
+        // Recuperato, oppure di sicuro assente (un buco nella numerazione): non manca più.
+        w.mancanti = w.mancanti.filter((n) => n !== gruppo[j]);
+        if (res.kind === "article") w.articoli.push({ n: gruppo[j], label: res.label, testo: res.testo });
+      });
+      if (rs.some((r) => r.res.kind === "error" && r.res.classe === "bloccato")) break;
+    }
+    w.articoli.sort((a, b) => a.n - b.n);
+  }
+  return w;
 }
 
 /**
  * Nota da appendere al testo scansionato: dichiara esplicitamente se quanto
  * precede è completo o parziale, e come recuperare il resto.
  */
-function notaFineScansione(motivo: MotivoStop, cap: number, statusErrore?: number, anomalie = 0, articoliLetti = 0): string {
-  if (motivo === "fine") {
-    if (anomalie === 0) return "";
-    return `\n\n---\n*⚠️ Durante il recupero Normattiva ha risposto con errori temporanei (${anomalie}), superati ritentando. La fine del testo è stata confermata con più tentativi, ma quegli errori sono indistinguibili da "articolo inesistente": se ti aspetti altri articoli, verifica con \`articolo=${articoliLetti + 1}\`.*`;
+function notaFineScansione(w: Scansione, cap: number): string {
+  const note: string[] = [];
+  const ultimo = w.articoli.length ? w.articoli[w.articoli.length - 1].n : 0;
+  const perche = w.errore ? ` (${w.errore.dettaglio})` : "";
+  const buchi = lacune(w);
+  if (buchi.length === 1) {
+    note.push(`⚠️ Testo PARZIALE: Normattiva non ha restituito l'art. ${buchi[0]} nemmeno ritentando${perche}. NON indica che manchi: richiedilo con \`articolo=${buchi[0]}\`.`);
+  } else if (buchi.length > 1) {
+    note.push(`⚠️ Testo PARZIALE: Normattiva non ha restituito gli artt. ${buchi.join(", ")} nemmeno ritentando${perche}. NON indica che manchino: richiedili con \`articolo=N\`.`);
   }
-  if (motivo === "cap") {
-    return `\n\n---\n*Testo troncato ai primi ${cap} articoli. Usa \`articolo=N\` per consultare i successivi.*`;
+  if (w.motivo === "cap") {
+    note.push(`Testo troncato ai primi ${cap} articoli. Usa \`articolo=N\` per consultare i successivi.`);
+  } else if (w.motivo === "tempo") {
+    note.push(`⚠️ Recupero interrotto per limite di tempo dopo l'art. ${ultimo}: il testo sopra è PARZIALE. Richiedi gli articoli successivi con \`articolo=N\`.`);
+  } else if (w.motivo === "errore") {
+    const come = w.errore?.classe === "bloccato"
+      ? `Normattiva sta bloccando temporaneamente le richieste${perche}. Il testo sopra è PARZIALE: attendi almeno mezzo minuto prima di richiedere gli articoli successivi con \`articolo=N\`, uno per volta.`
+      : w.errore?.classe === "permanente"
+        ? `un errore di Normattiva${perche}. Il testo sopra è PARZIALE: richiedi gli articoli successivi con \`articolo=N\`.`
+        : `errori temporanei di Normattiva${perche}. Il testo sopra è PARZIALE e mancano gli articoli successivi: riprova tra qualche secondo, oppure richiedi i singoli articoli con \`articolo=N\`.`;
+    note.push(`⚠️ Recupero interrotto dopo l'art. ${ultimo}: ${come}`);
   }
-  if (motivo === "tempo") {
-    return `\n\n---\n*⚠️ Recupero interrotto per limite di tempo: il testo sopra è PARZIALE. Richiedi gli articoli mancanti con \`articolo=N\`.*`;
-  }
-  return `\n\n---\n*⚠️ Recupero interrotto da un errore di Normattiva (${spiegaHttp(statusErrore ?? 0)}): il testo sopra è PARZIALE e mancano gli articoli successivi. Riprova tra qualche secondo, oppure richiedi i singoli articoli con \`articolo=N\`.*`;
+  return note.length ? `\n\n---\n${note.map((t) => `*${t}*`).join("\n")}` : "";
 }
 
 /**
@@ -773,7 +893,7 @@ async function resolveAtto(p: {
   tipo_atto?: string;
   numero?: number;
   anno?: number;
-}): Promise<{ codiceRedazionale: string; dataGU: string } | { error: string }> {
+}, scadenza?: number): Promise<{ codiceRedazionale: string; dataGU: string } | { error: string }> {
   const stripZeros = (s: unknown) => String(s ?? "").replace(/^0+/, "");
 
   // 1. Codice + dataGU già disponibili
@@ -784,24 +904,25 @@ async function resolveAtto(p: {
   // Una ricerca FALLITA (5xx, anti-bot, rete) non è una ricerca a vuoto: prima
   // finiva anch'essa in "Nessun atto trovato... Verifica i dati".
   const ricercaFallita = (e: EsitoApi, cosa: string) => ({
-    error: `⚠️ Errore temporaneo di Normattiva nella ricerca di ${cosa} (${descriviEsito(e)}, dopo ${e.tentativi} tentativi): la ricerca non è andata a buon fine, quindi questo NON indica che l'atto non esista. Riprova tra qualche istante.`,
+    error: spiegaErrore(comeErrore(e), `la ricerca di ${cosa} non è andata a buon fine`, "Questo NON indica che l'atto non esista."),
   });
 
   // 2. tipo_atto + numero + anno
   if (p.tipo_atto && p.numero != null && p.anno != null) {
-    const tipo = normalizzaTipoAtto(p.tipo_atto);
-    const cerca = (denominazioneAtto: string) => apiPostStatus("/ricerca/avanzata", {
-      denominazioneAtto,
-      numeroProvvedimento: p.numero,
-      annoProvvedimento: p.anno,
-      orderType: "recente",
-      paginazione: { paginaCorrente: 1, numeroElementiPerPagina: 10 },
-    });
-    let e = await cerca(tipo);
-    if (e.status === 200 && !e.incompleta && !e.data?.listaAtti?.length && tipo === "DECRETO MINISTERIALE") {
-      e = await cerca("DECRETO"); // vedi DECRETI_MINISTERIALI
-    }
-    if (e.status !== 200 || e.incompleta) return ricercaFallita(e, `${tipo} n. ${p.numero}/${p.anno}`);
+    const denominazioni = denominazioniTipoAtto(p.tipo_atto);
+    const tipo = denominazioni[0];
+    const { r: e, usata } = await conRipieghi(
+      denominazioni,
+      (denominazioneAtto) => apiPostStatus("/ricerca/avanzata", {
+        denominazioneAtto,
+        numeroProvvedimento: p.numero,
+        annoProvvedimento: p.anno,
+        orderType: "recente",
+        paginazione: { paginaCorrente: 1, numeroElementiPerPagina: 10 },
+      }, { scadenza }),
+      (e) => e.classe === "ok" && ricercaVuota(e.data),
+    );
+    if (e.classe !== "ok") return ricercaFallita(e, `${usata} n. ${p.numero}/${p.anno}`);
     const lista: any[] = e.data?.listaAtti || [];
     let pick = lista[0];
     if (p.codice_redazionale) {
@@ -810,7 +931,8 @@ async function resolveAtto(p: {
     if (pick?.codiceRedazionale && pick?.dataGU) {
       return { codiceRedazionale: pick.codiceRedazionale, dataGU: pick.dataGU };
     }
-    return { error: `Nessun atto trovato per ${tipo} n. ${p.numero}/${p.anno}. Verifica i dati (i valori ammessi per tipo_atto sono nel tool tipi_atto) oppure usa ricerca_avanzata/trova_atto_specifico.` };
+    const anche = denominazioni.length > 1 ? ` (cercato anche come ${denominazioni.slice(1).join(", ")})` : "";
+    return { error: `Nessun atto trovato per ${tipo} n. ${p.numero}/${p.anno}${anche}. Verifica i dati (i valori ammessi per tipo_atto sono nel tool tipi_atto) oppure usa ricerca_avanzata/trova_atto_specifico.` };
   }
 
   // 3. Solo codice redazionale: prova a risolvere la dataGU via ricerca testuale
@@ -819,8 +941,8 @@ async function resolveAtto(p: {
       testoRicerca: p.codice_redazionale,
       orderType: "recente",
       paginazione: { paginaCorrente: 1, numeroElementiPerPagina: 10 },
-    });
-    if (e.status !== 200 || e.incompleta) return ricercaFallita(e, `del codice redazionale "${p.codice_redazionale}"`);
+    }, { scadenza });
+    if (e.classe !== "ok") return ricercaFallita(e, `del codice redazionale "${p.codice_redazionale}"`);
     const lista: any[] = e.data?.listaAtti || [];
     const match = lista.find((a) => stripZeros(a?.codiceRedazionale) === stripZeros(p.codice_redazionale));
     if (match?.codiceRedazionale && match?.dataGU) {
@@ -941,7 +1063,7 @@ function compatta(s: string): string {
 // Valori ufficiali di denominazioneAtto (GET /tipologiche/denominazione-atto,
 // letti il 2026-09-18), con il loro codice. L'API li vuole ESATTI: con "legge"
 // invece di "LEGGE" la ricerca non trova nulla, e dettaglio_atto rispondeva
-// "Nessun atto trovato per legge n. 241/1990. Verifica i dati" \u2014 18 volte su 18
+// "Nessun atto trovato per legge n. 241/1990. Verifica i dati" — 18 volte su 18
 // nei log del server fra il 04 e il 18/09/2026 (L. 241/1990, D.Lgs. 196/2003,
 // D.Lgs. 82/2005, D.P.R. 380/2001...): atti che esistono.
 const TIPI_ATTO: Array<[string, string]> = [
@@ -963,31 +1085,76 @@ const TIPI_ATTO: Array<[string, string]> = [
   ["RDL", "REGIO DECRETO LEGISLATIVO"], ["D10", "REGOLAMENTO"],
 ];
 
-// Abbreviazioni d'uso comune (confronto su compatta(): "D.Lgs." \u2192 "dlgs").
-// Niente "R.D.L.": "RDL" \u00e8 gi\u00e0 il codice API di REGIO DECRETO LEGISLATIVO (cos\u00ec
-// lo mostra il tool tipi_atto) e il codice ha la precedenza.
+// Abbreviazioni d'uso comune (confronto su compatta(): "D.Lgs." → "dlgs"). Hanno
+// la precedenza sui codici dell'API: "R.D.L." nelle citazioni è il regio
+// decreto-legge, anche se "RDL" è il codice API del REGIO DECRETO LEGISLATIVO
+// (che resta raggiungibile col nome per esteso o con "R.D.Lgs.").
 const ALIAS_TIPO_ATTO: Record<string, string> = {
   l: "LEGGE", lcost: "LEGGE COSTITUZIONALE", cost: "COSTITUZIONE",
   dlgs: "DECRETO LEGISLATIVO", dlg: "DECRETO LEGISLATIVO", dleg: "DECRETO LEGISLATIVO", dlegs: "DECRETO LEGISLATIVO",
   dl: "DECRETO-LEGGE", dpr: "DECRETO DEL PRESIDENTE DELLA REPUBBLICA",
   dpcm: "DECRETO DEL PRESIDENTE DEL CONSIGLIO DEI MINISTRI", dm: "DECRETO MINISTERIALE",
-  rd: "REGIO DECRETO", dlgt: "DECRETO LEGISLATIVO LUOGOTENENZIALE",
-  dllgt: "DECRETO LEGISLATIVO LUOGOTENENZIALE", dlcps: "DECRETO LEGISLATIVO DEL CAPO PROVVISORIO DELLO STATO",
+  rd: "REGIO DECRETO", rdl: "REGIO DECRETO-LEGGE", rdlgs: "REGIO DECRETO LEGISLATIVO",
+  dlgt: "DECRETO LUOGOTENENZIALE", dllgt: "DECRETO-LEGGE LUOGOTENENZIALE",
+  dlgslgt: "DECRETO LEGISLATIVO LUOGOTENENZIALE",
+  dlcps: "DECRETO LEGISLATIVO DEL CAPO PROVVISORIO DELLO STATO",
+  dlgscps: "DECRETO LEGISLATIVO DEL CAPO PROVVISORIO DELLO STATO",
 };
 
-// DECRETI_MINISTERIALI: su Normattiva i decreti ministeriali stanno quasi sempre
-// come "DECRETO", non "DECRETO MINISTERIALE" (es. D.M. 10 marzo 2014, n. 55 sui
-// parametri forensi = "DECRETO 10 marzo 2014, n. 55", codice 14G00067): cercati
-// come DECRETO MINISTERIALE non si trovano. Se quella ricerca va a vuoto si
-// ripete con "DECRETO".
+// Denominazioni da riprovare, nell'ordine, quando la ricerca con quella chiesta
+// va a vuoto. I decreti ministeriali su Normattiva stanno quasi sempre come
+// "DECRETO" (es. D.M. 10 marzo 2014, n. 55 sui parametri forensi = "DECRETO 10
+// marzo 2014, n. 55", codice 14G00067): cercati come DECRETO MINISTERIALE non si
+// trovano. "D.Lgt." si usa sia per il decreto luogotenenziale sia per quello
+// legislativo luogotenenziale.
+const RIPIEGHI_TIPO_ATTO: Record<string, string[]> = {
+  "DECRETO MINISTERIALE": ["DECRETO"],
+  "DECRETO LUOGOTENENZIALE": ["DECRETO LEGISLATIVO LUOGOTENENZIALE"],
+  "DECRETO LEGISLATIVO LUOGOTENENZIALE": ["DECRETO LUOGOTENENZIALE"],
+};
 
 /** Riporta tipo_atto al valore esatto che l'API si aspetta (vedi TIPI_ATTO). */
 function normalizzaTipoAtto(tipo: string): string {
   const q = compatta(tipo);
-  for (const [codice, valore] of TIPI_ATTO) {
-    if (compatta(valore) === q || compatta(codice) === q) return valore;
+  const perNome = TIPI_ATTO.find(([, valore]) => compatta(valore) === q);
+  if (perNome) return perNome[1];
+  if (Object.hasOwn(ALIAS_TIPO_ATTO, q)) return ALIAS_TIPO_ATTO[q];
+  const perCodice = TIPI_ATTO.find(([codice]) => compatta(codice) === q);
+  return perCodice ? perCodice[1] : tipo.trim().toUpperCase();
+}
+
+/** Denominazioni da provare per tipo_atto: quella esatta, poi i ripieghi. */
+function denominazioniTipoAtto(tipo: string): string[] {
+  const d = normalizzaTipoAtto(tipo);
+  return [d, ...(RIPIEGHI_TIPO_ATTO[d] ?? [])];
+}
+
+/** Ricerca senza alcun risultato (non solo una pagina vuota). */
+function ricercaVuota(data: any): boolean {
+  return !data?.listaAtti?.length && !Number(data?.numeroAttiTrovati);
+}
+
+/**
+ * Esegue `cerca` con ciascuna denominazione finché una dà risultati (vedi
+ * RIPIEGHI_TIPO_ATTO); restituisce la risposta e la denominazione usata.
+ */
+async function conRipieghi<T>(denominazioni: string[], cerca: (d: string) => Promise<T>, vuota: (r: T) => boolean): Promise<{ r: T; usata: string }> {
+  let usata = denominazioni[0];
+  let r = await cerca(usata);
+  for (const d of denominazioni.slice(1)) {
+    if (!vuota(r)) break;
+    usata = d;
+    r = await cerca(d);
   }
-  return ALIAS_TIPO_ATTO[q] ?? tipo.trim().toUpperCase();
+  return { r, usata };
+}
+
+/** Avviso in testa ai risultati quando la ricerca ha ripiegato su altre denominazioni. */
+function notaRipiego(denominazioni: string[], usata: string | undefined, data: any): string {
+  if (!usata || usata === denominazioni[0]) return "";
+  return ricercaVuota(data)
+    ? `*Nessun atto né come «${denominazioni[0]}» né come ${denominazioni.slice(1).map((d) => `«${d}»`).join(", ")}.*\n\n`
+    : `*Nessun atto come «${denominazioni[0]}»: risultati per «${usata}», la denominazione con cui Normattiva classifica questi atti.*\n\n`;
 }
 
 /**
@@ -1012,13 +1179,40 @@ function trovaCorpoNormativo(nome: string): { corpo: CorpoNormativo } | { error:
 }
 
 // ============================================================================
+// VALIDAZIONE DEI PARAMETRI
+// ============================================================================
+
+/**
+ * Data nel formato dell'API (AAAA-MM-GG); gg/mm/aaaa, comune in italiano (anche
+ * con - o . come separatore), viene convertita. Va controllata qui: con una data
+ * malformata (es. "2020/01/01") Normattiva risponde col suo errore generico,
+ * identico a quello dei guasti temporanei, e il server la ritenterebbe invano
+ * dando la colpa a un disservizio.
+ */
+function dataApi(descrizione: string) {
+  return z.string().transform((s, ctx) => {
+    const t = s.trim();
+    const iso = /^(\d{4})-(\d{2})-(\d{2})$/.exec(t);
+    const it = /^(\d{1,2})[\/.-](\d{1,2})[\/.-](\d{4})$/.exec(t);
+    const data = iso ? t : it ? `${it[3]}-${it[2].padStart(2, "0")}-${it[1].padStart(2, "0")}` : "";
+    // Il passaggio da Date scarta le date impossibili (es. 2023-02-30).
+    const d = data ? new Date(`${data}T00:00:00Z`) : null;
+    if (!d || Number.isNaN(d.getTime()) || d.toISOString().slice(0, 10) !== data) {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, message: `data non valida "${s}": usa il formato AAAA-MM-GG (es. 2024-03-15)` });
+      return z.NEVER;
+    }
+    return data;
+  }).describe(descrizione);
+}
+
+// ============================================================================
 // SERVER MCP
 // ============================================================================
 
 const server = new McpServer(
   {
     name: "normattiva",
-    version: "1.4.0",
+    version: "1.4.1",
   },
   {
     instructions: `Server MCP per la normativa italiana (banca dati ufficiale Normattiva). I testi restituiti sono nella versione vigente (multivigente), salvo diversa data_vigenza.
@@ -1032,7 +1226,7 @@ Come scegliere lo strumento:
 4. Novità e modifiche normative in un periodo: atti_aggiornati.
 I codici e i testi unici approvati con decreto (codice civile, penale, ecc.) hanno gli articoli negli allegati dell'atto: dettaglio_atto li gestisce automaticamente (nome_codice seleziona già l'allegato giusto).
 
-ERRORI TEMPORANEI: Normattiva a volte risponde con un errore generico anche per testi che esistono (il server ritenta già più volte). Se un tool segnala un errore temporaneo o una risposta incompleta, NON concludere che l'articolo o l'atto non esistano e non citarli a memoria: riprova dopo qualche secondo e, se l'errore persiste, dichiara all'utente che il testo non è stato recuperato.
+ERRORI TEMPORANEI: Normattiva a volte risponde con un errore generico anche per testi che esistono (il server ritenta già più volte). Se un tool segnala un errore temporaneo o una risposta incompleta, NON concludere che l'articolo o l'atto non esistano e non citarli a memoria: riprova dopo qualche secondo e, se l'errore persiste, dichiara all'utente che il testo non è stato recuperato. Se un tool segnala un blocco delle richieste (anti-bot), attendi almeno mezzo minuto prima di riprovare e non lanciare richieste in parallelo.
 
 Se nella sessione è disponibile anche un connettore dedicato a specifici codici (es. iCodici, strumento recupera_articoli), per gli articoli dei codici che quello copre puoi preferirlo (batch più rapidi); usa questo server per il resto della legislazione, per le ricerche e per le vigenze storiche.`,
   }
@@ -1086,14 +1280,14 @@ server.tool(
     testo_titolo: z.string().optional().describe("Parole da cercare nel titolo dell'atto"),
     testo_ricerca: z.string().optional().describe("Parole da cercare nel testo dell'atto"),
     tipo_atto: z.string().optional().describe("Tipo di atto (es. 'LEGGE', 'DECRETO LEGISLATIVO', 'DECRETO-LEGGE', 'DECRETO', 'DECRETO DEL PRESIDENTE DELLA REPUBBLICA', 'COSTITUZIONE'). Usare il valore esatto dalla tipologica."),
-    data_inizio_emanazione: z.string().optional().describe("Data inizio emanazione nel formato YYYY-MM-DD"),
-    data_fine_emanazione: z.string().optional().describe("Data fine emanazione nel formato YYYY-MM-DD"),
-    data_inizio_pubblicazione: z.string().optional().describe("Data inizio pubblicazione GU nel formato YYYY-MM-DD"),
-    data_fine_pubblicazione: z.string().optional().describe("Data fine pubblicazione GU nel formato YYYY-MM-DD"),
-    data_vigenza: z.string().optional().describe("Data di vigenza di interesse nel formato YYYY-MM-DD (per ottenere il testo vigente a quella data)"),
+    data_inizio_emanazione: dataApi("Data inizio emanazione nel formato YYYY-MM-DD").optional(),
+    data_fine_emanazione: dataApi("Data fine emanazione nel formato YYYY-MM-DD").optional(),
+    data_inizio_pubblicazione: dataApi("Data inizio pubblicazione GU nel formato YYYY-MM-DD").optional(),
+    data_fine_pubblicazione: dataApi("Data fine pubblicazione GU nel formato YYYY-MM-DD").optional(),
+    data_vigenza: dataApi("Data di vigenza di interesse nel formato YYYY-MM-DD (per ottenere il testo vigente a quella data)").optional(),
     classe_provvedimento: z.enum(["1", "2", "3"]).optional().describe("Classe: '1' = senza aggiornamenti, '2' = aggiornato, '3' = abrogato"),
-    anno_provvedimento: z.number().int().optional().describe("Anno di emanazione del provvedimento"),
-    numero_provvedimento: z.number().int().optional().describe("Numero del provvedimento"),
+    anno_provvedimento: z.number().int().min(1800).optional().describe("Anno di emanazione del provvedimento"),
+    numero_provvedimento: z.number().int().min(1).optional().describe("Numero del provvedimento"),
     ordine: z.enum(["recente", "vecchio"]).default("recente").describe("Ordine dei risultati"),
     pagina: z.number().int().min(1).default(1).describe("Numero di pagina"),
     risultati_per_pagina: z.number().int().min(1).max(50).default(10).describe("Risultati per pagina"),
@@ -1110,7 +1304,6 @@ server.tool(
 
       if (params.testo_titolo) body.titoloRicerca = params.testo_titolo;
       if (params.testo_ricerca) body.testoRicerca = params.testo_ricerca;
-      if (params.tipo_atto) body.denominazioneAtto = normalizzaTipoAtto(params.tipo_atto);
       if (params.data_inizio_emanazione) body.dataInizioEmanazione = params.data_inizio_emanazione;
       if (params.data_fine_emanazione) body.dataFineEmanazione = params.data_fine_emanazione;
       if (params.data_inizio_pubblicazione) body.dataInizioPubProvvedimento = params.data_inizio_pubblicazione;
@@ -1120,8 +1313,14 @@ server.tool(
       if (params.anno_provvedimento) body.annoProvvedimento = params.anno_provvedimento;
       if (params.numero_provvedimento) body.numeroProvvedimento = params.numero_provvedimento;
 
-      const data = await apiPost("/ricerca/avanzata", body);
-      const formatted = formatListaAtti(data);
+      // tipo_atto: il valore ufficiale, poi i ripieghi se non trova nulla (es. D.M. → DECRETO).
+      const denominazioni = params.tipo_atto ? denominazioniTipoAtto(params.tipo_atto) : [];
+      const cerca = (denominazioneAtto?: string) =>
+        apiPost("/ricerca/avanzata", denominazioneAtto ? { ...body, denominazioneAtto } : body);
+      const { r: data, usata } = denominazioni.length
+        ? await conRipieghi(denominazioni, cerca, ricercaVuota)
+        : { r: await cerca(), usata: undefined };
+      const formatted = notaRipiego(denominazioni, usata, data) + formatListaAtti(data);
 
       return {
         content: [{ type: "text", text: limitaTesto(formatted, "Riduci `risultati_per_pagina` o restringi i criteri di ricerca.") }],
@@ -1143,15 +1342,14 @@ server.tool(
   `Trova i metadati di un atto normativo specifico quando conosci tipo, numero e anno (es. "D.Lgs. 152/2006" -> tipo='DECRETO LEGISLATIVO', numero=152, anno=2006). Restituisce i riferimenti (codice redazionale, data GU). Se ti serve direttamente il TESTO dell'atto o di un articolo, salta questo passaggio e usa subito dettaglio_atto con gli stessi tipo_atto+numero+anno.`,
   {
     tipo_atto: z.string().describe("Tipo di atto: i valori più comuni sono 'LEGGE', 'DECRETO LEGISLATIVO', 'DECRETO-LEGGE', 'DECRETO DEL PRESIDENTE DELLA REPUBBLICA', 'DECRETO DEL PRESIDENTE DEL CONSIGLIO DEI MINISTRI', 'LEGGE COSTITUZIONALE', 'COSTITUZIONE', 'REGIO DECRETO', 'REGIO DECRETO-LEGGE', 'DECRETO MINISTERIALE', 'REGOLAMENTO', 'ORDINANZA'. L'elenco completo è nel tool tipi_atto."),
-    numero: z.number().int().describe("Numero dell'atto"),
-    anno: z.number().int().describe("Anno di emanazione"),
-    data_vigenza: z.string().optional().describe("Data di vigenza (YYYY-MM-DD) per ottenere la versione vigente a quella data. Se omesso, restituisce la versione più recente."),
+    numero: z.number().int().min(1).describe("Numero dell'atto"),
+    anno: z.number().int().min(1800).describe("Anno di emanazione"),
+    data_vigenza: dataApi("Data di vigenza (YYYY-MM-DD) per ottenere la versione vigente a quella data. Se omesso, restituisce la versione più recente.").optional(),
   },
   async ({ tipo_atto, numero, anno, data_vigenza }) => {
     try {
-      const tipo = normalizzaTipoAtto(tipo_atto);
+      const denominazioni = denominazioniTipoAtto(tipo_atto);
       const body: Record<string, unknown> = {
-        denominazioneAtto: tipo,
         annoProvvedimento: anno,
         numeroProvvedimento: numero,
         orderType: "recente",
@@ -1165,11 +1363,12 @@ server.tool(
         body.vigenza = data_vigenza;
       }
 
-      let data: any = await apiPost("/ricerca/avanzata", body);
-      if (!data?.listaAtti?.length && tipo === "DECRETO MINISTERIALE") {
-        data = await apiPost("/ricerca/avanzata", { ...body, denominazioneAtto: "DECRETO" }); // vedi DECRETI_MINISTERIALI
-      }
-      const formatted = formatListaAtti(data);
+      const { r: data, usata } = await conRipieghi(
+        denominazioni,
+        (denominazioneAtto) => apiPost("/ricerca/avanzata", { ...body, denominazioneAtto }),
+        ricercaVuota,
+      );
+      const formatted = notaRipiego(denominazioni, usata, data) + formatListaAtti(data);
 
       return {
         content: [{ type: "text", text: limitaTesto(formatted, "Riduci `risultati_per_pagina` o restringi i criteri di ricerca.") }],
@@ -1192,14 +1391,14 @@ server.tool(
   {
     nome_codice: z.string().optional().describe("Nome comune di un codice/testo unico/legge fondamentale (es. 'codice civile', 'c.p.', 'c.p.a.', 'TU edilizia', 'TUB', 'legge 241'). Identifica direttamente l'atto e l'allegato corretti. Elenco completo nel tool corpi_normativi."),
     codice_redazionale: z.string().optional().describe("Codice redazionale dell'atto (es. '006G0171', '010U0639'), dai risultati di ricerca. In alternativa usa nome_codice oppure tipo_atto+numero+anno."),
-    data_gu: z.string().optional().describe("Data di pubblicazione in Gazzetta Ufficiale (YYYY-MM-DD, campo 'dataGU' dei risultati). Se omessa viene risolta automaticamente."),
+    data_gu: dataApi("Data di pubblicazione in Gazzetta Ufficiale (YYYY-MM-DD, campo 'dataGU' dei risultati). Se omessa viene risolta automaticamente.").optional(),
     tipo_atto: z.string().optional().describe("Tipo di atto per identificarlo senza codice (es. 'LEGGE', 'DECRETO LEGISLATIVO', 'REGIO DECRETO', 'DECRETO DEL PRESIDENTE DELLA REPUBBLICA'). Da usare con 'numero' e 'anno'."),
-    numero: z.number().int().optional().describe("Numero dell'atto (con tipo_atto e anno)."),
-    anno: z.number().int().optional().describe("Anno dell'atto (con tipo_atto e numero)."),
+    numero: z.number().int().min(1).optional().describe("Numero dell'atto (con tipo_atto e anno)."),
+    anno: z.number().int().min(1800).optional().describe("Anno dell'atto (con tipo_atto e numero)."),
     articolo: z.number().int().min(1).optional().describe("Numero dell'articolo da recuperare (es. 192). Se omesso, restituisce l'intestazione e l'art. 1."),
     estensione: z.string().optional().describe("Estensione dell'articolo: 'bis', 'ter', 'quater', ... fino a 'vicies' (es. articolo=609 + estensione='bis' per l'art. 609-bis). Richiede 'articolo'."),
     allegato: z.number().int().min(0).optional().describe("Sezione dell'atto in cui cercare: 0 = corpo dell'atto, 1..N = allegato N-esimo. Normalmente NON serve: corpo e allegati vengono esplorati automaticamente (e nome_codice imposta già la sezione giusta)."),
-    data_vigenza: z.string().optional().describe("Data di vigenza (YYYY-MM-DD) per ottenere il testo vigente a quella data. Se omesso, versione vigente attuale."),
+    data_vigenza: dataApi("Data di vigenza (YYYY-MM-DD) per ottenere il testo vigente a quella data. Se omesso, versione vigente attuale.").optional(),
     testo_completo: z.boolean().default(false).describe("Se true, recupera tutti gli articoli dell'atto (fino a un massimo di 40). Ignorato se è specificato 'articolo'."),
   },
   async ({ nome_codice, codice_redazionale, data_gu, tipo_atto, numero, anno, articolo, estensione, allegato, data_vigenza, testo_completo }) => {
@@ -1216,25 +1415,35 @@ server.tool(
       let cr: string;
       let dg: string;
       let flagFisso: number | undefined = allegato != null ? allegato : undefined;
-      let corpoNome: string | undefined;
-      let corpoNota: string | undefined;
       let corpo: CorpoNormativo | undefined;
 
       if (nome_codice) {
         const m = trovaCorpoNormativo(nome_codice);
         if ("error" in m) return bad(m.error);
-        cr = m.corpo.codice;
-        dg = m.corpo.dataGU;
-        corpoNome = `${m.corpo.nome} — ${m.corpo.riferimento}`;
-        corpoNota = m.corpo.nota;
         corpo = m.corpo;
-        if (flagFisso == null) flagFisso = m.corpo.flag;
+        cr = corpo.codice;
+        dg = corpo.dataGU;
+        if (flagFisso == null) flagFisso = corpo.flag;
       } else {
-        const resolved = await resolveAtto({ codice_redazionale, data_gu, tipo_atto, numero, anno });
+        const resolved = await resolveAtto({ codice_redazionale, data_gu, tipo_atto, numero, anno }, scadenza);
         if ("error" in resolved) return bad(resolved.error);
         cr = resolved.codiceRedazionale;
         dg = resolved.dataGU;
       }
+
+      // Nome e numerazione nota del corpo normativo valgono per la SUA sezione:
+      // un `allegato` esplicito diverso ne interroga un'altra (es. allegato=1 con
+      // il codice civile = le preleggi, 31 articoli).
+      const corpoSezione = corpo && flagFisso === corpo.flag ? corpo : undefined;
+      const sezione = (f: number) => (f === 0 ? "corpo dell'atto" : `allegato ${f}`);
+      const corpoNome = corpo
+        ? corpoSezione
+          ? `${corpo.nome} — ${corpo.riferimento}`
+          : `${corpo.riferimento.replace(/\s*\(.*\)$/, "")}, ${sezione(flagFisso!)}`
+        : undefined;
+      const corpoNota = corpo?.nota;
+      const dove = corpoNome ? `in "${corpoNome}"` : `per l'atto ${cr} (dataGU ${dg})`;
+      const diAtto = corpoNome ? `di "${corpoNome}"` : `dell'atto ${cr} (dataGU ${dg})`;
 
       // Estensione dell'articolo (-bis, -ter, ...) -> campo sottoArticolo dell'API.
       let sottoArt: number | undefined;
@@ -1255,52 +1464,36 @@ server.tool(
       const conCorpo = (intest: string) =>
         corpoNome ? `[${corpoNome}]${corpoNota ? `\n(Nota: ${corpoNota})` : ""}\n${intest}` : intest;
 
+      // Risposta «Atto non trovato»: il riferimento non individua alcun atto.
+      const attoNonTrovato = () => bad(corpo
+        ? `Normattiva non riconosce l'atto di "${corpo.nome}" con i riferimenti cablati nel server (codice redazionale ${cr}, data GU ${dg}: risposta «Atto non trovato»). Identifica l'atto con tipo_atto + numero + anno (${corpo.riferimento}).`
+        : `Atto non trovato su Normattiva: il codice redazionale ${cr} con data GU ${dg} non individua alcun atto. Verifica i due valori: vanno presi insieme dai risultati di ricerca_semplice, ricerca_avanzata o trova_atto_specifico, e data_gu è la data di pubblicazione in Gazzetta Ufficiale, non quella dell'atto. In alternativa identifica l'atto con tipo_atto + numero + anno.`);
+
       // === Caso 1: articolo specifico (ricerca automatica in corpo e allegati) ===
       if (articolo != null) {
-        const ultimo = sottoArt == null ? corpo?.ultimoArticolo : undefined;
+        const ultimo = sottoArt == null ? corpoSezione?.ultimoArticolo : undefined;
         const r = await fetchArticoloAuto(baseBody, articolo, sottoArt, flagFisso, {
           // Oltre l'ultimo articolo noto bastano 2 richieste: servono solo a non
           // fidarsi alla cieca della tabella.
           tentativi: ultimo != null && articolo > ultimo ? 2 : TENTATIVI_ARTICOLO,
           scadenza,
         });
-        if (r.res.kind === "notfound" || r.res.kind === "error") {
-          // ⚠️ Un 404 persistente è AMBIGUO (vedi erroreGenerico): prima di dire
-          // "non trovato" serve un riscontro, altrimenti si dice che Normattiva è
-          // in errore. Mai "verifica il numero" sulla sola parola dell'API.
-          const dove = corpoNome ? `in "${corpoNome}"` : `per l'atto ${cr} (dataGU ${dg})`;
-          const quante = r.res.tentativi === 1 ? "all'unico tentativo" : `a tutti i ${r.res.tentativi} tentativi`;
-          const GENERICO = "«Errore generico della chiamata, riprovare più tardi»";
-          const RIPROVA = "Riprova, anche subito: gli errori di Normattiva sono intermittenti e un nuovo tentativo spesso riesce. Se l'errore persiste, dichiara all'utente che il testo non è stato recuperato, senza citarlo a memoria.";
-          const generico = r.res.kind === "notfound" || r.res.generico;
-
-          // 1) Numerazione nota (codici principali): esito certo nei due sensi.
-          if (ultimo != null && generico) {
-            if (articolo <= ultimo) {
-              return bad(`⚠️ Risposta incompleta da Normattiva, errore temporaneo: riprova. L'art. ${articolo} ${dove} ESISTE (il ${corpo!.nome} va dall'art. 1 all'art. ${ultimo}, abrogati compresi), ma Normattiva non l'ha restituito: ${quante} ha risposto ${GENERICO}. È un disservizio di Normattiva, non un problema del riferimento. ${RIPROVA}`);
-            }
-            return bad(`Articolo ${articolo} non trovato ${dove}: il ${corpo!.nome} arriva all'art. ${ultimo} (oltre ci sono solo articoli con estensione, es. ${ultimo}-bis). Verifica il numero.`);
+        const oltreNumerazione = ultimo != null && articolo > ultimo
+          ? ` La numerazione del ${corpoSezione!.nome} arriva all'art. ${ultimo} (oltre, solo eventuali articoli con estensione: -bis, -ter, ...).`
+          : "";
+        if (r.res.kind === "atto") return attoNonTrovato();
+        if (r.res.kind === "assente") {
+          const sezioni = flagFisso == null ? " (cercato nel corpo dell'atto e negli allegati 1-3)" : "";
+          return bad(`Articolo ${etichettaArt} non trovato ${dove}${sezioni}: Normattiva risponde che non esiste.${oltreNumerazione} Verifica il numero${sottoArt != null ? " e l'estensione" : ""}.`);
+        }
+        if (r.res.kind === "error") {
+          const fallito = `l'articolo ${etichettaArt} ${dove} non è stato recuperato`;
+          // Numerazione nota (codici principali): anche senza risposta si sa se l'articolo esiste.
+          if (r.res.classe === "transitorio" && ultimo != null) {
+            if (articolo > ultimo) return bad(`Articolo ${etichettaArt} non trovato ${dove}.${oltreNumerazione} Verifica il numero.`);
+            return bad(spiegaErrore(r.res, fallito, `L'art. ${articolo} ESISTE (il ${corpoSezione!.nome} va dall'art. 1 all'art. ${ultimo}, abrogati compresi): è un disservizio di Normattiva, non un problema del riferimento.`));
           }
-
-          // 2) Errore che non è un 404: temporaneo, oppure (400...) parametri errati.
-          if (r.res.kind === "error") {
-            if (r.res.status === 200 || transitorio(r.res.status, r.res.generico, null)) {
-              return bad(`⚠️ Errore temporaneo di Normattiva: l'articolo ${etichettaArt} ${dove} non è stato recuperato (${r.res.dettaglio}, dopo ${r.res.tentativi} ${r.res.tentativi === 1 ? "tentativo" : "tentativi"}). NON indica che l'articolo non esista. ${RIPROVA}`);
-            }
-            return bad(`Errore nel recupero dell'articolo ${etichettaArt} ${dove} — ${r.res.dettaglio}`);
-          }
-
-          // 3) 404 persistente: riscontro sull'art. 1 della stessa sezione, che
-          // esiste sempre. Se Normattiva non restituisce nemmeno quello, il 404
-          // è il suo guasto; se lo restituisce, l'articolo potrebbe davvero mancare.
-          if (articolo === 1 && sottoArt == null) {
-            return bad(`⚠️ Risposta incompleta da Normattiva, errore temporaneo: riprova. Normattiva non ha restituito l'art. 1 ${dove}: ${quante} ha risposto ${GENERICO}. L'art. 1 esiste in ogni atto, quindi è un disservizio di Normattiva, a meno che l'atto sia identificato male (codice_redazionale/data_gu scritti a mano: ricavali da una ricerca). ${RIPROVA}`);
-          }
-          const riscontro = await fetchDettaglioArticolo(baseBody, 1, flagFisso ?? 0, undefined, { tentativi: 3, ritenta404: true, scadenza });
-          if (riscontro.res.kind === "article" || riscontro.res.kind === "empty") {
-            return bad(`Articolo ${etichettaArt} non restituito da Normattiva ${dove}: ${quante} l'API ha risposto ${GENERICO}. È la risposta che Normattiva dà per un articolo inesistente, ma anche per i propri guasti temporanei, quindi da sola non prova che l'articolo manchi. L'art. 1 dello stesso atto invece viene restituito: è possibile che numero o estensione siano errati, verificali. Se il riferimento è sicuro, riprova prima di concludere che l'articolo non esiste.`);
-          }
-          return bad(`⚠️ Risposta incompleta da Normattiva, errore temporaneo: riprova. L'articolo ${etichettaArt} ${dove} non è stato recuperato: ${quante} Normattiva ha risposto ${GENERICO}, e in questo momento non restituisce nemmeno l'art. 1 dello stesso atto. È un disservizio di Normattiva: NON indica che l'articolo non esista. ${RIPROVA}`);
+          return bad(spiegaErrore(r.res, fallito, "NON indica che l'articolo non esista."));
         }
         const intest = conCorpo(formatIntestazioneAtto(r.atto, cr, dg, data_vigenza));
         if (r.res.kind === "empty") {
@@ -1310,126 +1503,124 @@ server.tool(
         return out(`${intest}\n\n---\n**${r.res.label}**${nota}\n${r.res.testo}`);
       }
 
-      // Messaggi per quando Normattiva non restituisce nulla di utile: con questa
-      // API può essere il suo errore generico (vedi erroreGenerico), quindi mai
-      // "atto non trovato" o "verifica i parametri" senza dirlo.
-      const GENERICO = "«Errore generico della chiamata, riprovare più tardi»";
-      const erroreTemporaneo = (cosa: string, res: Extract<ArticoloResult, { kind: "error" }>) =>
-        res.status === 200 || transitorio(res.status, res.generico, null)
-          ? bad(`⚠️ Errore temporaneo di Normattiva: ${cosa} non è stato recuperato (${res.dettaglio}, dopo ${res.tentativi} ${res.tentativi === 1 ? "tentativo" : "tentativi"}). NON indica che il testo non esista. Riprova, anche subito: gli errori di Normattiva sono intermittenti.`)
-          : bad(`Errore nel recupero di ${cosa} — ${res.dettaglio}`);
-      const art1Mancante = (tentativi: number) =>
-        bad(`⚠️ Risposta incompleta da Normattiva, errore temporaneo: riprova. Normattiva non ha restituito l'art. 1 di "${corpoNome}", che esiste: ${tentativi === 1 ? "all'unico tentativo" : `a tutti i ${tentativi} tentativi`} ha risposto ${GENERICO}. È un disservizio di Normattiva. Riprova, anche subito: gli errori sono intermittenti. Se l'errore persiste, dichiara all'utente che il testo non è stato recuperato.`);
-      const sezioneVuota = () =>
-        bad(`Nessun articolo restituito per la sezione richiesta (allegato ${flagFisso}) dell'atto ${cr} (dataGU ${dg}). O la sezione non esiste, o Normattiva è in errore temporaneo (risponde ${GENERICO} anche per testi esistenti): riprova e, se persiste, verifica il numero di allegato.`);
-      const attoNonRestituito = () =>
-        bad(`Normattiva non ha restituito l'atto ${cr} (dataGU ${dg}). Se codice_redazionale e data_gu vengono da una ricerca è un suo errore temporaneo (risponde ${GENERICO} anche per atti esistenti): riprova, anche subito. Altrimenti verificali: entrambi vanno presi dai risultati di ricerca_semplice/avanzata o trova_atto_specifico.`);
+      // La sezione fissata non ha nemmeno l'art. 1 (risposta certa di Normattiva).
+      const sezioneInesistente = () =>
+        bad(`Nessun articolo nella sezione richiesta (${sezione(flagFisso!)}) ${diAtto}: Normattiva risponde che l'art. 1 non c'è.${allegato != null ? " Verifica il numero di allegato (0 = corpo dell'atto)." : ""}`);
+      // L'atto esiste (nessun «Atto non trovato») ma l'art. 1 non c'è né nel corpo né nell'allegato 1.
+      const senzaArticoli = async () => {
+        const bare = await fetchDettaglioArticolo(baseBody, undefined, 0, undefined, { tentativi: 3, scadenza });
+        if (bare.atto) return out(`${formatIntestazioneAtto(bare.atto, cr, dg, data_vigenza)}\n\n(Nessun testo di articolo disponibile per questo atto.)`);
+        if (bare.res.kind === "error") return bad(spiegaErrore(bare.res, `il testo ${diAtto} non è stato recuperato`, "NON indica che l'atto non abbia testo."));
+        if (bare.res.kind === "atto") return attoNonTrovato();
+        return bad(`Normattiva non restituisce articoli ${diAtto}: l'art. 1 non c'è né nel corpo dell'atto né nell'allegato 1. Se l'atto ha più allegati, prova con \`allegato=2\`.`);
+      };
 
       // === Caso 2: testo completo ===
       if (testo_completo) {
+        const testoDi = (w: Scansione) => w.articoli.map((a) => `**${a.label}**\n${a.testo}`).join("\n\n---\n");
+        // Scansione chiusa con certezza: l'atto finisce lì e non manca nulla.
+        const certa = (w: Scansione) => w.motivo === "fine" && w.mancanti.length === 0;
+        // Nessun articolo letto, senza certezze: atto non riconosciuto, errore o tempo scaduto.
+        const nienteLetto = (w: Scansione) =>
+          w.motivo === "atto" ? attoNonTrovato() : bad(spiegaErrore(w.errore ?? TEMPO_ESAURITO, `il testo ${diAtto} non è stato recuperato`));
+
         // Sezione fissata (nome_codice o allegato esplicito): scorri solo quella.
         if (flagFisso != null) {
           const w = await walkArticoli(baseBody, flagFisso, CAP, scadenza);
           if (w.articoli.length === 0) {
-            if (w.motivo === "errore") return bad(`⚠️ Errore temporaneo di Normattiva nel recupero del testo — ${spiegaHttp(w.statusErrore ?? 0)} Non indica che il testo non esista.`);
-            if (w.atto) return out(`${conCorpo(formatIntestazioneAtto(w.atto, cr, dg, data_vigenza))}\n\nNessun articolo trovato nella sezione richiesta (allegato ${flagFisso}).`);
-            // Art. 1 non restituito nemmeno ritentando: in un codice noto esiste di sicuro.
-            return corpo ? art1Mancante(TENTATIVI_ARTICOLO) : sezioneVuota();
+            if (!certa(w)) return nienteLetto(w);
+            return w.atto
+              ? out(`${conCorpo(formatIntestazioneAtto(w.atto, cr, dg, data_vigenza))}\n\nNessun articolo trovato nella sezione richiesta (${sezione(flagFisso)}).`)
+              : sezioneInesistente();
           }
           const intest = conCorpo(formatIntestazioneAtto(w.atto, cr, dg, data_vigenza));
-          const parts = w.articoli.map((a) => `**${a.label}**\n${a.testo}`);
-          let o = `${intest}\n\n${parts.join("\n\n---\n")}`;
-          o += notaFineScansione(w.motivo, CAP, w.statusErrore, w.anomalie, w.articoli.length);
+          let o = `${intest}\n\n${testoDi(w)}`;
+          o += notaFineScansione(w, CAP);
           o += `\n*Gli articoli con estensione (-bis, -ter, ...) non compaiono nello scorrimento: recuperali con articolo=N + estensione.*`;
           return out(o);
         }
         const main = await walkArticoli(baseBody, 0, CAP, scadenza);
-        // Un blocco anti-bot o un 5xx sul PRIMO articolo lascerebbe la scansione a
-        // mani vuote: senza questo controllo si finirebbe nel ramo "Atto non
-        // trovato", che manda l'utente a correggere parametri in realtà corretti.
-        if (main.articoli.length === 0 && main.motivo === "errore") {
-          return bad(`⚠️ Errore temporaneo di Normattiva nel recupero del testo dell'atto ${cr} (dataGU ${dg}) — ${spiegaHttp(main.statusErrore ?? 0)} Non indica che l'atto non esista.`);
-        }
-        if (main.articoli.length >= 2) {
+        if (main.articoli.length === 0 && !certa(main)) return nienteLetto(main);
+        // Atto ordinario, oppure scansione incompleta: si mostra quel che c'è,
+        // dichiarando cosa manca.
+        if (main.articoli.length >= 2 || !certa(main)) {
           const intest = formatIntestazioneAtto(main.atto, cr, dg, data_vigenza);
-          const parts = main.articoli.map((a) => `**${a.label}**\n${a.testo}`);
-          let o = `${intest}\n\n${parts.join("\n\n---\n")}`;
-          o += notaFineScansione(main.motivo, CAP, main.statusErrore, main.anomalie, main.articoli.length);
-          return out(o);
+          return out(`${intest}\n\n${testoDi(main)}${notaFineScansione(main, CAP)}`);
         }
-        // ≤1 articolo nella parte articolata: il contenuto vero potrebbe essere l'allegato/testo unico
+        // ≤1 articolo nel corpo, con certezza: il contenuto vero può essere l'allegato (testo unico).
         const alleg = await walkArticoli(baseBody, 1, CAP, scadenza);
         const atto = alleg.atto || main.atto;
-        if (alleg.articoli.length === 0 && alleg.motivo === "errore" && !atto) {
-          return bad(`⚠️ Errore temporaneo di Normattiva nel recupero del testo dell'atto ${cr} (dataGU ${dg}) — ${spiegaHttp(alleg.statusErrore ?? 0)} Non indica che l'atto non esista.`);
-        }
         if (alleg.articoli.length >= 1) {
           const intest = formatIntestazioneAtto(atto, cr, dg, data_vigenza);
-          const parts = alleg.articoli.map((a) => `**${a.label}**\n${a.testo}`);
-          let o = `${intest}\n\n*Testo unico allegato:*\n\n${parts.join("\n\n---\n")}`;
-          o += notaFineScansione(alleg.motivo, CAP, alleg.statusErrore, alleg.anomalie, alleg.articoli.length);
+          let o = `${intest}\n\n*Testo unico allegato:*\n\n${testoDi(alleg)}`;
+          o += notaFineScansione(alleg, CAP);
           // Segnala eventuali allegati ulteriori (es. codice civile = allegato 2 del R.D. 262/1942).
-          const succ = await fetchDettaglioArticolo(baseBody, 1, 2, undefined, { tentativi: 2, ritenta404: true, scadenza });
+          const succ = await fetchDettaglioArticolo(baseBody, 1, 2, undefined, { tentativi: 2, scadenza });
           if (succ.res.kind === "article") o += `\n*L'atto contiene ulteriori allegati: usa \`allegato=2\` (o superiore) per consultarli.*`;
           return out(o);
         }
         if (main.articoli.length === 1) {
+          // Atto ad articolo unico; se l'allegato non si è potuto controllare, va detto.
+          const avviso = certa(alleg) || alleg.motivo === "atto"
+            ? ""
+            : `\n\n---\n*⚠️ Non è stato possibile verificare se l'atto ha un allegato con altri articoli (${(alleg.errore ?? TEMPO_ESAURITO).dettaglio}): se te lo aspetti, riprova o usa \`allegato=1\`.*`;
           const intest = formatIntestazioneAtto(main.atto, cr, dg, data_vigenza);
-          // Un solo articolo può voler dire "atto ad articolo unico" (motivo "fine")
-          // oppure scansione stroncata subito da un errore: va detto quale dei due.
-          return out(
-            `${intest}\n\n---\n**${main.articoli[0].label}**\n${main.articoli[0].testo}` +
-            notaFineScansione(main.motivo, CAP, main.statusErrore, main.anomalie, main.articoli.length)
-          );
+          return out(`${intest}\n\n---\n${testoDi(main)}${avviso}`);
         }
+        // Nessun articolo né nel corpo né nell'allegato 1.
+        if (!certa(alleg)) return nienteLetto(alleg);
         if (atto) {
           return out(`${formatIntestazioneAtto(atto, cr, dg, data_vigenza)}\n\nIl testo consolidato degli articoli non è ancora disponibile per questo atto.`);
         }
-        return attoNonRestituito();
+        return senzaArticoli();
       }
 
       // === Caso 3: default — intestazione + art. 1 (con rilevamento testo unico) ===
-      // L'art. 1 esiste sempre: si ritenta anche il 404 (può essere il guasto).
-      const retryArt1: OpzioniRetry = { tentativi: TENTATIVI_ARTICOLO, ritenta404: true, scadenza };
+      const tentativiArt1: OpzioniRetry = { tentativi: TENTATIVI_ARTICOLO, scadenza };
       // Sezione fissata (nome_codice o allegato esplicito): mostra l'art. 1 di quella sezione.
       if (flagFisso != null) {
-        const a1f = await fetchDettaglioArticolo(baseBody, 1, flagFisso, undefined, retryArt1);
+        const a1f = await fetchDettaglioArticolo(baseBody, 1, flagFisso, undefined, tentativiArt1);
         if (a1f.res.kind === "article") {
           const intest = conCorpo(formatIntestazioneAtto(a1f.atto, cr, dg, data_vigenza));
           return out(`${intest}\n\n---\n**${a1f.res.label}**\n${a1f.res.testo}\n\n---\n*Usa \`articolo=N\` (con eventuale \`estensione\`) per un articolo specifico, oppure \`testo_completo=true\` per l'intero testo.*`);
         }
-        if (a1f.res.kind === "empty" && a1f.atto) {
+        if (a1f.res.kind === "empty") {
           return out(`${conCorpo(formatIntestazioneAtto(a1f.atto, cr, dg, data_vigenza))}\n\nIl testo consolidato non è disponibile per questa sezione.`);
         }
-        if (a1f.res.kind === "error" && !a1f.res.generico) return erroreTemporaneo("l'atto", a1f.res);
-        return corpo ? art1Mancante(a1f.res.tentativi) : sezioneVuota();
+        if (a1f.res.kind === "atto") return attoNonTrovato();
+        if (a1f.res.kind === "assente") return sezioneInesistente();
+        return bad(spiegaErrore(a1f.res, `l'art. 1 ${diAtto} non è stato recuperato`,
+          corpoSezione ? "L'art. 1 esiste: è un disservizio di Normattiva, NON indica che il testo manchi." : undefined));
       }
-      const a1 = await fetchDettaglioArticolo(baseBody, 1, 0, undefined, retryArt1);
+      const a1 = await fetchDettaglioArticolo(baseBody, 1, 0, undefined, tentativiArt1);
+      if (a1.res.kind === "atto") return attoNonTrovato();
       if (a1.res.kind === "error") {
-        return erroreTemporaneo(`l'atto ${cr} (dataGU ${dg})`, a1.res);
+        return bad(spiegaErrore(a1.res, `l'atto ${cr} (dataGU ${dg}) non è stato recuperato`, "NON indica che l'atto non esista."));
       }
       if (a1.res.kind === "empty") {
         return out(`${formatIntestazioneAtto(a1.atto, cr, dg, data_vigenza)}\n\nIl testo consolidato degli articoli non è ancora disponibile per questo atto (probabilmente molto recente). È consultabile nella Gazzetta Ufficiale indicata.`);
       }
 
-      // Se l'art. 1 è un "Articolo Unico" (o manca del tutto), il contenuto potrebbe essere nell'allegato.
+      // Se l'art. 1 è un "Articolo Unico" (o manca del tutto), il contenuto potrebbe
+      // essere nell'allegato. Conta solo un art. 2 che di sicuro non c'è: nel
+      // dubbio (errore) si mostra l'art. 1 dell'atto, che è comunque il suo.
       let soloArticoloUnico = false;
       if (a1.res.kind === "article") {
-        const a2 = await fetchDettaglioArticolo(baseBody, 2, 0, undefined, { tentativi: 2, ritenta404: true, scadenza });
-        soloArticoloUnico = a2.res.kind === "notfound";
+        const a2 = await fetchDettaglioArticolo(baseBody, 2, 0, undefined, { tentativi: 2, scadenza });
+        soloArticoloUnico = a2.res.kind === "assente";
       }
-      if (a1.res.kind === "notfound" || soloArticoloUnico) {
-        const alleg1 = await fetchDettaglioArticolo(baseBody, 1, 1, undefined, { tentativi: 3, ritenta404: true, scadenza });
+      if (a1.res.kind === "assente" || soloArticoloUnico) {
+        const alleg1 = await fetchDettaglioArticolo(baseBody, 1, 1, undefined, { tentativi: 3, scadenza });
         if (alleg1.res.kind === "article") {
           const intest = formatIntestazioneAtto(alleg1.atto || a1.atto, cr, dg, data_vigenza);
           return out(`${intest}\n\n*Atto che approva un testo unico: gli articoli sostanziali sono nell'allegato.*\n\n---\n**${alleg1.res.label}**\n${alleg1.res.testo}\n\n---\n*Usa \`articolo=N\` per un articolo (es. \`articolo=3\`), oppure \`testo_completo=true\` per l'intero testo.*`);
         }
-        if (a1.res.kind === "notfound") {
-          const bare = await fetchDettaglioArticolo(baseBody, undefined, 0, undefined, { tentativi: 3, ritenta404: true, scadenza });
-          if (bare.atto) {
-            return out(`${formatIntestazioneAtto(bare.atto, cr, dg, data_vigenza)}\n\n(Nessun testo di articolo disponibile per questo atto.)`);
+        if (a1.res.kind === "assente") {
+          if (alleg1.res.kind === "error") {
+            return bad(spiegaErrore(alleg1.res, `il testo ${diAtto} non è stato recuperato`, "NON indica che l'atto non abbia testo."));
           }
-          return attoNonRestituito();
+          if (alleg1.res.kind === "atto") return attoNonTrovato();
+          return senzaArticoli();
         }
         // soloArticoloUnico ma senza allegato: prosegue mostrando l'Articolo Unico.
       }

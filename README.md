@@ -172,28 +172,43 @@ a volte HTTP 500:
 {"message":"Errore generico della chiamata, riprovare più tardi","code":"1000"}
 ```
 
-Con status 404 è **identico** alla risposta per un articolo che non esiste
-(stesso corpo, stessi tempi): da solo non dice se l'articolo manca o se
-Normattiva è in errore. Tradurlo in "articolo non trovato, verifica il numero"
-porta un modello a concludere che articoli esistenti non esistono. Quindi:
+Tradurlo in "articolo non trovato, verifica il numero" porta un modello a
+concludere che articoli esistenti non esistono. Il corpo del 404 però distingue
+i casi (verificato sull'API il 24/10/2026): un articolo o un allegato che non
+esiste ha un messaggio specifico che ripete la richiesta (`idArticolo:...`),
+un codice redazionale con la data GU sbagliata dà `Atto non trovato`, e solo il
+guasto ha il corpo generico. Quindi:
 
-- **Ritentativi con backoff**: fino a 6 richieste per articolo (0,5 → 1 → 2 → 4 s,
-  con jitter) su 404/500 generici, 5xx, blocchi anti-bot, timeout e risposte 200
-  incomplete; nei log (`stderr`) ogni ritentativo è annotato.
+- **Ogni risposta è classificata una volta sola**: articolo assente (404
+  specifico), atto non riconosciuto, errore temporaneo (corpo generico, 5xx,
+  timeout, risposte 200 incomplete), blocco anti-bot (409/429), errore
+  permanente (400, 500 con un messaggio specifico). Si ritentano solo gli errori
+  temporanei: fino a 6 richieste per articolo (0,5 → 1 → 2 s, con jitter),
+  annotate su `stderr`. Contro l'anti-bot un solo ritentativo, poi il server si
+  ferma e invita ad aspettare: insistere prolunga il blocco.
+- **"Non trovato" solo con una risposta certa**: il 404 specifico, oppure, per i
+  codici principali (Costituzione, c.c., c.p., c.p.c., c.p.p.), un numero oltre
+  l'ultimo articolo. Se Normattiva non risponde, il messaggio è "errore
+  temporaneo" e, entro la numerazione nota, dice che l'articolo esiste.
+- **Corpo e allegati in ordine**: si passa all'allegato solo se nel corpo
+  l'articolo di sicuro non c'è; un errore nel corpo non fa restituire l'articolo
+  con lo stesso numero di un allegato.
 - **I 404 non vanno in cache** (solo le risposte 200 complete): altrimenti un
   falso "non trovato" resta attaccato all'articolo per tutta la sessione.
-- **"Non trovato" solo con un riscontro.** Per i codici principali (Costituzione,
-  c.c., c.p., c.p.c., c.p.p.) la numerazione è nota: entro l'ultimo articolo il
-  server risponde "errore temporaneo, riprova" (l'articolo esiste; gli abrogati
-  restano, come "ARTICOLO ABROGATO"), oltre risponde "non trovato". Negli altri
-  casi controlla l'art. 1 dello stesso atto: se nemmeno quello arriva è un
-  disservizio di Normattiva, altrimenti la risposta dichiara l'ambiguità.
-- **`testo_completo`** conferma il 404 che chiude la scansione prima di
-  presentare il testo come completo, e segnala gli errori superati ritentando.
+- **Date controllate prima della richiesta**: una data malformata riceve da
+  Normattiva lo stesso errore generico del guasto. Il server accetta
+  `AAAA-MM-GG` e converte `gg/mm/aaaa`; il resto è un errore di parametro.
+- **`testo_completo`** chiude l'atto solo su un 404 specifico. Un articolo che
+  non arriva nemmeno ritentando non tronca il testo: gli articoli successivi
+  restano e il buco è dichiarato. Blocco anti-bot e budget di tempo fermano la
+  scansione con l'avviso "PARZIALE", e il budget di 40 s vale anche per le
+  singole richieste (timeout accorciato a quanto resta).
 - **`tipo_atto`** viene riportato al valore esatto che l'API vuole (`legge` →
-  `LEGGE`, `D.Lgs.` → `DECRETO LEGISLATIVO`, codici come `PLE`): scritto in
-  minuscolo la ricerca non trovava nulla. I decreti ministeriali stanno quasi
-  sempre come `DECRETO`: se `DECRETO MINISTERIALE` non trova nulla si ripiega lì.
+  `LEGGE`, `D.Lgs.` → `DECRETO LEGISLATIVO`, `R.D.L.` → `REGIO DECRETO-LEGGE`,
+  `D.Lgt.` → `DECRETO LUOGOTENENZIALE`): scritto in minuscolo la ricerca non
+  trovava nulla. I decreti ministeriali stanno quasi sempre come `DECRETO`: se
+  `DECRETO MINISTERIALE` non trova nulla si ripiega lì, in tutti i tool di
+  ricerca.
 
 `npm run test-guasti` verifica tutto questo contro un finto Normattiva locale che
 simula i guasti (deterministico, senza rete; gira anche in CI a ogni push).

@@ -1,6 +1,6 @@
 {
   "name": "normattiva-mcp",
-  "version": "1.4.0",
+  "version": "1.4.1",
   "description": "Server MCP per consultare la banca dati normativa italiana tramite le API Open Data di Normattiva",
   "type": "module",
   "license": "MIT",
