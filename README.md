@@ -125,6 +125,15 @@ dettaglio_atto(tipo_atto="DECRETO LEGISLATIVO", numero=152, anno=2006, articolo=
 - Le API di Normattiva sono gratuite e pubbliche
 - L'endpoint di produzione è `https://api.normattiva.it`
 - Il server usa il trasporto `stdio` (standard per MCP con Claude Desktop)
+- Con `--http` (`node build/index.js --http`) il server parla **Streamable HTTP senza sessioni**,
+  in un solo processo: è il modo usato sul server dello studio, dietro l'ingresso del plugin
+  iCodici Legal (strumenti `normattiva_…`). Endpoint `/mcp/<MCP_URL_TOKEN>` (chiave di almeno 32
+  caratteri; chiave sbagliata o assente → 404, mai 401), salute `/healthz`, porta `PORT`
+  (predefinita 8000). Senza `MCP_URL_TOKEN` l'endpoint è `/mcp` e resta aperto: solo per le prove.
+  Un header `MCP-Protocol-Version` che l'SDK non conosce (es. `2026-07-28` dei client Claude
+  recenti) viene riportato all'ultima versione supportata. Test: `npm run test-http`, senza rete.
+  Fino alla 1.4.1 il server in rete passava da supergateway, una sessione e un processo `node`
+  per client: vedi la storia del Dockerfile.
 - I log vengono scritti su `stderr` (non interferiscono con il protocollo MCP)
 - `dettaglio_atto` gestisce anche i **testi unici e i codici approvati con decreto** (codice civile, penale, procedura civile/penale, c.p.a., TULPS, legge fallimentare, ecc.): i loro articoli stanno negli **allegati** dell'atto (`flagTipoArticolo` dell'API: 0 = corpo, N = allegato N-esimo) e vengono cercati automaticamente in corpo e allegati 1–3. Il **codice civile** è l'allegato 2 del R.D. 262/1942 (l'allegato 1 sono le preleggi); il **c.p.a.** è l'allegato 2 del D.Lgs. 104/2010.
 - Gli articoli con estensione (`-bis`, `-ter`, … fino a `-vicies`) si recuperano con `articolo=N` + `estensione` (campo `sottoArticolo` dell'API: 2 = bis, 3 = ter, …).
