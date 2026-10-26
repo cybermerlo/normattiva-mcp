@@ -1,6 +1,6 @@
 {
   "name": "normattiva-mcp",
-  "version": "1.4.1",
+  "version": "1.5.0",
   "description": "Server MCP per consultare la banca dati normativa italiana tramite le API Open Data di Normattiva",
   "type": "module",
   "license": "MIT",
@@ -12,6 +12,7 @@
     "start": "node build/index.js",
     "smoke": "node scripts/smoke.mjs",
     "test-guasti": "node scripts/test-guasti.mjs",
+    "test-http": "node scripts/test-http.mjs",
     "valida-corpi": "node scripts/valida-corpi.mjs"
   },
   "files": ["build"],

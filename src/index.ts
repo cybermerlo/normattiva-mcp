@@ -13,6 +13,10 @@
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
+import { LATEST_PROTOCOL_VERSION, SUPPORTED_PROTOCOL_VERSIONS } from "@modelcontextprotocol/sdk/types.js";
+import http from "node:http";
+import { timingSafeEqual } from "node:crypto";
 import { z } from "zod";
 
 // ============================================================================
@@ -1209,10 +1213,15 @@ function dataApi(descrizione: string) {
 // SERVER MCP
 // ============================================================================
 
+// Il server si costruisce con una funzione: in HTTP senza sessioni ne serve uno
+// nuovo per ogni richiesta (vedi avviaHttp). Il corpo NON è rientrato di
+// proposito: le istruzioni e le descrizioni dei tool sono template literal su
+// più righe, e un rientro cambierebbe il testo che arriva ai client.
+function creaServer(): McpServer {
 const server = new McpServer(
   {
     name: "normattiva",
-    version: "1.4.1",
+    version: "1.5.0",
   },
   {
     instructions: `Server MCP per la normativa italiana (banca dati ufficiale Normattiva). I testi restituiti sono nella versione vigente (multivigente), salvo diversa data_vigenza.
@@ -1785,17 +1794,159 @@ server.tool(
   }
 );
 
+return server;
+}
+
 // ============================================================================
 // AVVIO SERVER
 // ============================================================================
 
+// Due modi di avvio:
+// - stdio (predefinito), per l'uso in locale da Claude Desktop o Claude Code;
+// - `--http`, per il server: Streamable HTTP SENZA sessioni, un solo processo.
+//   Sostituisce supergateway, che avviava un processo `node` per ogni sessione
+//   (584 processi orfani ad agosto 2026), teneva una cache per processo e
+//   lasciava ai client sessioni che scadevano. Senza sessioni ogni richiesta è
+//   indipendente: un server MCP nuovo per richiesta, cache dei dati condivisa.
+
+/** Chiave nell'indirizzo (`/mcp/<chiave>`), da MCP_URL_TOKEN. Sotto i 32
+ *  caratteri non vale: un valore corto per sbaglio non apre l'accesso. Senza
+ *  chiave l'endpoint è `/mcp`, aperto: solo per le prove in locale. */
+const CHIAVE_MIN = 32;
+
+function chiaveDaAmbiente(): string | null {
+  const v = (process.env.MCP_URL_TOKEN || "").trim();
+  if (!v) return null;
+  if (v.length < CHIAVE_MIN) {
+    throw new Error(`MCP_URL_TOKEN troppo corta (${v.length} caratteri, minimo ${CHIAVE_MIN}): il server non parte.`);
+  }
+  return v;
+}
+
+function chiaveGiusta(data: string, attesa: string): boolean {
+  const a = Buffer.from(data, "utf8");
+  const b = Buffer.from(attesa, "utf8");
+  return a.length === b.length && timingSafeEqual(a, b);
+}
+
+const CORPO_MAX = 1_000_000; // byte: le richieste MCP vere sono di pochi kB
+
+function leggiCorpo(req: http.IncomingMessage): Promise<unknown> {
+  return new Promise((resolve, reject) => {
+    let n = 0;
+    const parti: Buffer[] = [];
+    req.on("data", (c: Buffer) => {
+      n += c.length;
+      if (n > CORPO_MAX) {
+        reject(new Error("corpo troppo grande"));
+        req.destroy();
+        return;
+      }
+      parti.push(c);
+    });
+    req.on("end", () => {
+      try {
+        resolve(JSON.parse(Buffer.concat(parti).toString("utf8")));
+      } catch {
+        reject(new Error("JSON non valido"));
+      }
+    });
+    req.on("error", reject);
+  });
+}
+
+function rispondi(res: http.ServerResponse, status: number, corpo: unknown): void {
+  res.writeHead(status, { "Content-Type": "application/json" }).end(JSON.stringify(corpo));
+}
+
+async function avviaHttp(): Promise<void> {
+  const chiave = chiaveDaAmbiente();
+  const porta = Number(process.env.PORT) || 8000;
+  const percorso = chiave ? `/mcp/${chiave}` : "/mcp";
+
+  const httpServer = http.createServer(async (req, res) => {
+    const url = (req.url || "").split("?")[0];
+
+    if (url === "/healthz") {
+      rispondi(res, 200, { status: "ok", versione: "1.5.0", protezione: chiave ? "chiave" : "nessuna" });
+      return;
+    }
+    // Chiave sbagliata, mancante o percorso sconosciuto: 404, mai 401. Un 401
+    // fa partire nei client la scoperta OAuth (/.well-known/...), che qui non c'è.
+    const giusto = chiave
+      ? url.startsWith("/mcp/") && chiaveGiusta(url.slice("/mcp/".length), chiave)
+      : url === "/mcp";
+    if (!giusto) {
+      rispondi(res, 404, { error: "Not found" });
+      return;
+    }
+    // Senza sessioni non c'è uno stream server→client da aprire (GET) né una
+    // sessione da chiudere (DELETE).
+    if (req.method !== "POST") {
+      res.writeHead(405, { Allow: "POST" }).end();
+      return;
+    }
+
+    // Protocollo: l'SDK rifiuta con 400 le versioni che non conosce, e i client
+    // Claude recenti mandano `MCP-Protocol-Version: 2026-07-28` anche dopo aver
+    // negoziato 2025-11-25 nella initialize. Qui la si riporta all'ultima
+    // supportata: è ciò che faceva la Transform Rule di Cloudflare (2026-09-02),
+    // che così non serve più e non tocca le chiamate sulla rete interna.
+    // L'SDK legge gli header da `rawHeaders` (li converte in una Request web con
+    // @hono/node-server), quindi va corretto lì oltre che in `headers`.
+    const versione = req.headers["mcp-protocol-version"];
+    if (typeof versione === "string" && !SUPPORTED_PROTOCOL_VERSIONS.includes(versione)) {
+      req.headers["mcp-protocol-version"] = LATEST_PROTOCOL_VERSION;
+      for (let i = 0; i < req.rawHeaders.length; i += 2) {
+        if (req.rawHeaders[i].toLowerCase() === "mcp-protocol-version") req.rawHeaders[i + 1] = LATEST_PROTOCOL_VERSION;
+      }
+    }
+
+    let corpo: unknown;
+    try {
+      corpo = await leggiCorpo(req);
+    } catch (e) {
+      rispondi(res, 400, { jsonrpc: "2.0", error: { code: -32700, message: `Parse error: ${(e as Error).message}` }, id: null });
+      return;
+    }
+
+    const server = creaServer();
+    const transport = new StreamableHTTPServerTransport({
+      sessionIdGenerator: undefined, // nessuna sessione
+      enableJsonResponse: true, // risposta JSON, niente stream SSE
+    });
+    res.on("close", () => {
+      transport.close().catch(() => {});
+      server.close().catch(() => {});
+    });
+    try {
+      await server.connect(transport);
+      await transport.handleRequest(req, res, corpo);
+    } catch (e) {
+      console.error("[Normattiva MCP] Errore nella richiesta HTTP:", e);
+      if (!res.headersSent) {
+        rispondi(res, 500, { jsonrpc: "2.0", error: { code: -32603, message: "Errore interno" }, id: null });
+      }
+    }
+  });
+
+  await new Promise<void>((resolve) => httpServer.listen(porta, resolve));
+  console.error(`[Normattiva MCP] HTTP senza sessioni sulla porta ${porta}, endpoint ${chiave ? "/mcp/<chiave>" : "/mcp (APERTO: nessuna MCP_URL_TOKEN)"}, salute /healthz`);
+}
+
 async function main() {
   console.error("[Normattiva MCP] Avvio server...");
   console.error(`[Normattiva MCP] Endpoint API: ${API_BASE}`);
-  
+
+  if (process.argv.includes("--http")) {
+    await avviaHttp();
+    return;
+  }
+
+  const server = creaServer();
   const transport = new StdioServerTransport();
   await server.connect(transport);
-  
+
   console.error("[Normattiva MCP] Server connesso e in ascolto.");
 }
 
