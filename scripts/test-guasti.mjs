@@ -199,6 +199,53 @@ async function main() {
   verifica("2043-bis inesistente → non trovato, una richiesta",
     r.errore && r.testo.includes("non trovato") && conta(k(CC, 2043, 2, 2)) === 1, `${conta(k(CC, 2043, 2, 2))} chiamate: ${corto(r)}`);
 
+  // --- Articoli decimali (sottoArticolo1: 10 = base, 20 = ".1", 30 = ".2") ------
+
+  imposta(k(CP, 452, 1, 2), artAllegato("452-bis.1", "(Commercio di prodotti inquinanti)."));
+  r = await chiama({ nome_codice: "c.p.", articolo: 452, estensione: "bis", decimale: 1 });
+  verifica("452-bis.1 con decimale=1 → sottoArticolo 2, sottoArticolo1 20, etichetta completa",
+    !r.errore && r.testo.includes("**Art. 452-bis.1**") && r.testo.includes("prodotti inquinanti") &&
+      ultimoCorpo.get(k(CP, 452, 1, 2))?.sottoArticolo1 === 20, corto(r));
+
+  imposta(k(CP, 635, 1, 4), artAllegato("635-quater.1", "(Detenzione, diffusione e installazione abusiva)."));
+  r = await chiama({ nome_codice: "c.p.", articolo: 635, estensione: "quater.1" });
+  verifica("estensione 'quater.1' → decimale 1 (sottoArticolo1 20)",
+    !r.errore && r.testo.includes("**Art. 635-quater.1**") && ultimoCorpo.get(k(CP, 635, 1, 4))?.sottoArticolo1 === 20, corto(r));
+
+  imposta(k(CP, 601, 1, 1), artAllegato("601.1", "(Approfittamento della vittima)."));
+  r = await chiama({ nome_codice: "c.p.", articolo: 601, decimale: 1 });
+  verifica("601.1 senza estensione → sottoArticolo 1, sottoArticolo1 20",
+    !r.errore && r.testo.includes("**Art. 601.1**") && ultimoCorpo.get(k(CP, 601, 1, 1))?.sottoArticolo1 === 20, corto(r));
+
+  r = await chiama({ nome_codice: "c.p.", articolo: 734, decimale: 3 });
+  verifica("decimale inesistente → non trovato, senza la numerazione del c.p. ('e il decimale')",
+    r.errore && r.testo.includes("734.3") && r.testo.includes("e il decimale") && !r.testo.includes("arriva all'art."), corto(r));
+
+  const primaDec = richieste.length;
+  r = await chiama({ nome_codice: "c.p.", decimale: 1 });
+  verifica("decimale senza articolo → errore di parametro, nessuna richiesta",
+    r.errore && r.testo.includes("richiede anche 'articolo'") && richieste.length === primaDec, corto(r));
+
+  r = await chiama({ nome_codice: "c.p.", articolo: 452, estensione: "bis.2", decimale: 1 });
+  verifica("decimale in contraddizione con l'estensione → errore di parametro", r.errore && r.testo.includes("contraddice"), corto(r));
+
+  // --- Data di vigenza: l'API la ignora, il tool lo dichiara ---------------------
+
+  const conVigenza = (n, testo, inizio, fine = "99999999") => {
+    const a = artAllegato(n, testo);
+    return { ...a, body: { ...a.body, data: { atto: { ...a.body.data.atto, articoloDataInizioVigenza: inizio, articoloDataFineVigenza: fine } } } };
+  };
+  imposta(k(CP, 452, 1, 2), conVigenza("452-bis", "(Inquinamento ambientale).", "20260602"));
+  r = await chiama({ nome_codice: "c.p.", articolo: 452, estensione: "bis", data_vigenza: "2010-01-01" });
+  verifica("data_vigenza anteriore alla versione restituita → avviso 'NON RISPETTATA'",
+    !r.errore && r.testo.includes("DATA DI VIGENZA NON RISPETTATA") && r.testo.includes("02/06/2026"), corto(r));
+  r = await chiama({ nome_codice: "c.p.", articolo: 452, estensione: "bis", data_vigenza: "2026-07-01" });
+  verifica("data_vigenza coperta dalla versione → nessun avviso, conferma",
+    !r.errore && !r.testo.includes("NON RISPETTATA") && r.testo.includes("vigente anche alla data richiesta"), corto(r));
+  r = await chiama({ nome_codice: "c.p.", articolo: 452, estensione: "bis" });
+  verifica("senza data_vigenza → solo la data di inizio della versione",
+    !r.errore && r.testo.includes("Versione in vigore dal 02/06/2026") && !r.testo.includes("richiesta"), corto(r));
+
   // Atto senza numerazione nota, articolo sempre in errore → errore temporaneo. Anche
   // con l'art. 1 in cache (vista di default): il riscontro sull'art. 1 non c'è più.
   imposta(k(TUE, 1, 0), artAkn(1, "Ambito di applicazione"));
@@ -291,7 +338,7 @@ async function main() {
   imposta(k(CC, 2044, 2), artAllegato(2044, "Non è responsabile chi cagiona il danno per legittima difesa"));
   r = await chiama({ nome_codice: "codice civile", articolo: 2044, data_vigenza: "1/3/2020" });
   verifica("data_vigenza gg/mm/aaaa convertita in AAAA-MM-GG",
-    !r.errore && ultimoCorpo.get(k(CC, 2044, 2))?.dataVigenza === "2020-03-01" && r.testo.includes("vigenza: 2020-03-01"), `${JSON.stringify(ultimoCorpo.get(k(CC, 2044, 2)))} ${corto(r)}`);
+    !r.errore && ultimoCorpo.get(k(CC, 2044, 2))?.dataVigenza === "2020-03-01" && r.testo.includes("vigenza richiesta: 2020-03-01"), `${JSON.stringify(ultimoCorpo.get(k(CC, 2044, 2)))} ${corto(r)}`);
   r = await chiama({ nome_codice: "codice civile", articolo: 2044, data_vigenza: "2023-02-30" });
   verifica("data impossibile (30 febbraio) rifiutata", r.errore && r.testo.includes("data non valida"), corto(r));
 

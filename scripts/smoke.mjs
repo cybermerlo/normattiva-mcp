@@ -79,11 +79,44 @@ const CASI = [
     attendi: (t) => t.toLowerCase().includes("non riconosciuto"),
   },
   {
-    nome: "errore: estensione non supportata (decimale)",
+    nome: "errore: estensione non riconosciuta",
     tool: "dettaglio_atto",
     args: { nome_codice: "TUB", articolo: 114, estensione: "1" },
     erroreAtteso: true,
     attendi: (t) => t.toLowerCase().includes("estensione"),
+  },
+  // Articoli decimali: campo sottoArticolo1 dell'API (20 = ".1", 30 = ".2").
+  {
+    nome: "art. 452-bis.1 c.p. (decimale con estensione)",
+    tool: "dettaglio_atto",
+    args: { nome_codice: "c.p.", articolo: 452, estensione: "bis", decimale: 1 },
+    attendi: (t) => t.includes("Art. 452-bis.1") && t.toLowerCase().includes("prodotti inquinanti"),
+  },
+  {
+    nome: "art. 601.1 c.p. (decimale senza estensione)",
+    tool: "dettaglio_atto",
+    args: { nome_codice: "c.p.", articolo: 601, decimale: 1 },
+    attendi: (t) => t.includes("Art. 601.1") && t.toLowerCase().includes("approfittamento"),
+  },
+  {
+    nome: "art. 270-quinquies.3 c.p. (estensione 'quinquies.3')",
+    tool: "dettaglio_atto",
+    args: { nome_codice: "c.p.", articolo: 270, estensione: "quinquies.3" },
+    attendi: (t) => t.includes("Art. 270-quinquies.3") && t.toLowerCase().includes("terrorismo"),
+  },
+  {
+    nome: "art. 25-octies.2 D.Lgs. 231/2001 (decimale nel corpo dell'atto)",
+    tool: "dettaglio_atto",
+    args: { nome_codice: "231/2001", articolo: 25, estensione: "octies", decimale: 2 },
+    attendi: (t) => t.includes("Art. 25-octies.2"),
+  },
+  {
+    // L'API ignora dataVigenza: il server deve dichiararlo, non spacciare il
+    // testo attuale per quello storico.
+    nome: "data_vigenza ignorata dall'API: avviso esplicito",
+    tool: "dettaglio_atto",
+    args: { nome_codice: "c.p.", articolo: 452, estensione: "bis", data_vigenza: "2010-01-01" },
+    attendi: (t) => t.includes("DATA DI VIGENZA NON RISPETTATA"),
   },
   {
     // /ricerca/aggiornati ignora la paginazione e restituisce l'intero periodo:

@@ -85,7 +85,7 @@ try {
   const url = new URL(`${BASE}/mcp/${CHIAVE}`);
   const client = new Client({ name: "test-http", version: "1.0.0" });
   await client.connect(new StreamableHTTPClientTransport(url));
-  verifica("initialize con la chiave", client.getServerVersion()?.version === "1.5.0", JSON.stringify(client.getServerVersion()));
+  verifica("initialize con la chiave", client.getServerVersion()?.version === "1.6.0", JSON.stringify(client.getServerVersion()));
   const { tools } = await client.listTools();
   verifica("8 tool", tools.length === 8, `(${tools.length})`);
   const col = await client.callTool({ name: "collezioni_predefinite", arguments: {} });

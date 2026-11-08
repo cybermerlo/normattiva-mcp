@@ -104,6 +104,9 @@ Claude utilizzerà automaticamente gli strumenti del server MCP per interrogare 
 dettaglio_atto(nome_codice="codice civile", articolo=2043)      → art. 2043 c.c.
 dettaglio_atto(nome_codice="c.p.", articolo=609, estensione="bis") → art. 609-bis c.p.
 dettaglio_atto(nome_codice="cpa", articolo=29)                  → art. 29 c.p.a.
+dettaglio_atto(nome_codice="c.p.", articolo=452, estensione="bis", decimale=1) → art. 452-bis.1 c.p.
+dettaglio_atto(nome_codice="c.p.", articolo=601, decimale=1)    → art. 601.1 c.p.
+dettaglio_atto(nome_codice="231/2001", articolo=25, estensione="octies.2") → art. 25-octies.2 D.Lgs. 231/2001
 dettaglio_atto(tipo_atto="DECRETO LEGISLATIVO", numero=152, anno=2006, articolo=192)
 ```
 
@@ -137,6 +140,8 @@ dettaglio_atto(tipo_atto="DECRETO LEGISLATIVO", numero=152, anno=2006, articolo=
 - I log vengono scritti su `stderr` (non interferiscono con il protocollo MCP)
 - `dettaglio_atto` gestisce anche i **testi unici e i codici approvati con decreto** (codice civile, penale, procedura civile/penale, c.p.a., TULPS, legge fallimentare, ecc.): i loro articoli stanno negli **allegati** dell'atto (`flagTipoArticolo` dell'API: 0 = corpo, N = allegato N-esimo) e vengono cercati automaticamente in corpo e allegati 1–3. Il **codice civile** è l'allegato 2 del R.D. 262/1942 (l'allegato 1 sono le preleggi); il **c.p.a.** è l'allegato 2 del D.Lgs. 104/2010.
 - Gli articoli con estensione (`-bis`, `-ter`, … fino a `-vicies`) si recuperano con `articolo=N` + `estensione` (campo `sottoArticolo` dell'API: 2 = bis, 3 = ter, …).
+- Gli **articoli decimali** (452-bis.1, 635-quater.1, 270-quinquies.3, 601.1 c.p.; 25-octies.2 D.Lgs. 231/2001, …) si recuperano con `decimale=N`, oppure con il decimale in coda all'estensione (`estensione="bis.1"`). L'API li individua col campo `sottoArticolo1`, non documentato: 10 = articolo base, 20 = `.1`, 30 = `.2`, … (la stessa numerazione dei link `caricaArticolo` del sito; i valori 1, 2, … danno 404). Verificato contro l'API l'8/11/2026.
+- **La data di vigenza non produce versioni storiche.** `/atto/dettaglio-atto` accetta `dataVigenza` ma la ignora: restituisce sempre la versione attuale (verificato l'8/11/2026: art. 452-bis c.p. chiesto al 2010 → testo in vigore dal 02/06/2026). Il server confronta la data chiesta con il periodo di vigenza dell'articolo restituito (`articoloDataInizioVigenza`/`articoloDataFineVigenza`) e, se non coincide, lo dichiara nella risposta invece di far passare il testo attuale per quello storico.
 
 ### Limiti di dimensione e di tempo
 

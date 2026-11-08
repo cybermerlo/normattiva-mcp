@@ -640,7 +640,8 @@ function extractArticolo(html: string, idArticolo?: number): { label: string; te
 
   // Allegato / testo unico: il numero d'articolo è testo semplice.
   let testo = htmlToText(html);
-  const m = testo.match(/Art(?:icolo)?\.?\s*\d+[\-A-Za-z]*/);
+  // Il suffisso ".N" copre gli articoli decimali (es. "Art. 452-bis.1").
+  const m = testo.match(/Art(?:icolo)?\.?\s*\d+[\-A-Za-z]*(?:\.\d+)?/);
   const label = m ? m[0].replace(/\s+/g, " ").trim() : (idArticolo != null ? `Art. ${idArticolo}` : "Allegato");
   // Rimuovi il numero d'articolo se è a inizio testo (evita il doppione con la label).
   testo = testo.replace(new RegExp("^" + label.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") + "\\.?\\s*"), "").trim();
@@ -880,7 +881,7 @@ function formatIntestazioneAtto(atto: any, codiceRedazionale: string, dataGU: st
     h += `GU n. ${atto.numeroGU} del ${String(atto.giornoGU).padStart(2, "0")}/${String(atto.meseGU).padStart(2, "0")}/${atto.annoGU}\n`;
   }
   h += `Codice redazionale: ${codiceRedazionale} — dataGU: ${dataGU}`;
-  if (dataVigenza) h += ` — vigenza: ${dataVigenza}`;
+  if (dataVigenza) h += ` — vigenza richiesta: ${dataVigenza} (l'API di Normattiva restituisce comunque il testo vigente oggi)`;
   return h;
 }
 
@@ -973,6 +974,52 @@ const SOTTO_ARTICOLO: Record<string, number> = {
 
 function normalizzaEstensione(e: string): string {
   return e.toLowerCase().trim().replace(/^-+/, "").replace(/\.+$/, "");
+}
+
+// ARTICOLI DECIMALI (es. 452-bis.1, 601.1, 25-octies.2 del D.Lgs. 231/2001).
+// L'API li individua col campo sottoArticolo1, che il server registra come
+// idSottoArticolo1 (lo si vede nel messaggio del 404). La numerazione è quella
+// dei link "caricaArticolo" del sito: 10 = articolo base, 20 = ".1", 30 = ".2",
+// ... Verificato contro l'API il 2026-11-08: 601.1, 452-bis.1, 635-quater.1,
+// 270-quinquies.1/.2/.3 c.p., 25-octies.1/.2 D.Lgs. 231/2001 (i valori 1 e 2
+// danno 404, lo 0 restituisce l'articolo base).
+const DECIMALE_MAX = 20;
+function sottoArticolo1Di(decimale: number): number {
+  return (decimale + 1) * 10;
+}
+
+/** Separa un eventuale suffisso decimale dall'estensione: "bis.1" → { "bis", 1 }. */
+function separaDecimale(e: string): { estensione: string; decimale?: number } {
+  const m = e.trim().match(/^(.*?)\.(\d+)$/);
+  return m ? { estensione: m[1], decimale: Number(m[2]) } : { estensione: e };
+}
+
+/** "20260602" → "02/06/2026"; undefined se non è una data AAAAMMGG. */
+function dataCompattaLeggibile(s: unknown): string | undefined {
+  const m = String(s ?? "").match(/^(\d{4})(\d{2})(\d{2})$/);
+  return m ? `${m[3]}/${m[2]}/${m[1]}` : undefined;
+}
+
+/**
+ * L'API ignora dataVigenza: restituisce sempre la versione attuale
+ * (verificato il 2026-11-08: art. 452-bis c.p. con dataVigenza 2010-01-01 →
+ * testo in vigore dal 02/06/2026). Con il periodo di vigenza dell'articolo
+ * restituito (articoloDataInizioVigenza/FineVigenza, AAAAMMGG) si dice quando
+ * il testo non è quello vigente alla data chiesta.
+ */
+function notaVigenza(atto: any, dataVigenza?: string): string {
+  const inizio = String(atto?.articoloDataInizioVigenza ?? "");
+  const fine = String(atto?.articoloDataFineVigenza ?? "");
+  const daIl = dataCompattaLeggibile(inizio);
+  if (!daIl) return "";
+  const versione = `Versione in vigore dal ${daIl}${fine && fine !== "99999999" && dataCompattaLeggibile(fine) ? ` al ${dataCompattaLeggibile(fine)}` : ""}.`;
+  if (!dataVigenza) return `\n\n*${versione}*`;
+  const chiesta = dataVigenza.replace(/-/g, "");
+  const [a, m, g] = dataVigenza.split("-");
+  if (chiesta >= inizio && (!/^\d{8}$/.test(fine) || chiesta <= fine)) {
+    return `\n\n*${versione} È il testo vigente anche alla data richiesta (${g}/${m}/${a}).*`;
+  }
+  return `\n\n---\n*⚠️ DATA DI VIGENZA NON RISPETTATA: hai chiesto il testo vigente al ${g}/${m}/${a}, ma Normattiva ha restituito la versione in vigore dal ${daIl}: la sua API ignora la data di vigenza. Il testo qui sopra NON è quello vigente alla data richiesta: non presentarlo come tale. Per la versione storica consulta l'atto sul sito normattiva.it (aggiornamenti dell'atto / versioni precedenti).*`;
 }
 
 // ============================================================================
@@ -1221,15 +1268,15 @@ function creaServer(): McpServer {
 const server = new McpServer(
   {
     name: "normattiva",
-    version: "1.5.0",
+    version: "1.6.0",
   },
   {
-    instructions: `Server MCP per la normativa italiana (banca dati ufficiale Normattiva). I testi restituiti sono nella versione vigente (multivigente), salvo diversa data_vigenza.
+    instructions: `Server MCP per la normativa italiana (banca dati ufficiale Normattiva). I testi restituiti sono nella versione vigente oggi: l'API di Normattiva ignora data_vigenza (verificato a novembre 2026), e dettaglio_atto segnala quando l'articolo restituito non era in vigore alla data richiesta.
 
 USO PROATTIVO: quando la risposta dipende dal contenuto esatto di norme italiane che sai identificare, recupera il testo con dettaglio_atto PRIMA di citarle, spiegarle o applicarle — anche se l'utente non chiede espressamente di "recuperare la norma". Non citare articoli a memoria (rischio di errori e abrogazioni non recepite); fondati sul testo restituito e indica la fonte.
 
 Come scegliere lo strumento:
-1. Articolo di un codice/testo unico noto (es. art. 2043 c.c., art. 575 c.p., art. 29 c.p.a., art. 36 TU pubblico impiego): dettaglio_atto con nome_codice (+articolo, eventualmente estensione='bis'/'ter'/...). L'elenco dei nomi supportati è nel tool corpi_normativi.
+1. Articolo di un codice/testo unico noto (es. art. 2043 c.c., art. 575 c.p., art. 29 c.p.a., art. 36 TU pubblico impiego): dettaglio_atto con nome_codice (+articolo, eventualmente estensione='bis'/'ter'/... e decimale per gli articoli come il 452-bis.1 c.p.). L'elenco dei nomi supportati è nel tool corpi_normativi.
 2. Atto identificato da una citazione (es. D.Lgs. 152/2006, L. 241/1990): dettaglio_atto con tipo_atto + numero + anno (+articolo). Nessuna ricerca preliminare necessaria.
 3. Ricerca tematica o atto non identificato: ricerca_semplice o ricerca_avanzata, poi dettaglio_atto con codice_redazionale + data_gu presi dai risultati.
 4. Novità e modifiche normative in un periodo: atti_aggiornati.
@@ -1237,7 +1284,7 @@ I codici e i testi unici approvati con decreto (codice civile, penale, ecc.) han
 
 ERRORI TEMPORANEI: Normattiva a volte risponde con un errore generico anche per testi che esistono (il server ritenta già più volte). Se un tool segnala un errore temporaneo o una risposta incompleta, NON concludere che l'articolo o l'atto non esistano e non citarli a memoria: riprova dopo qualche secondo e, se l'errore persiste, dichiara all'utente che il testo non è stato recuperato. Se un tool segnala un blocco delle richieste (anti-bot), attendi almeno mezzo minuto prima di riprovare e non lanciare richieste in parallelo.
 
-Se nella sessione è disponibile anche un connettore dedicato a specifici codici (es. iCodici, strumento recupera_articoli), per gli articoli dei codici che quello copre puoi preferirlo (batch più rapidi); usa questo server per il resto della legislazione, per le ricerche e per le vigenze storiche.`,
+Se nella sessione è disponibile anche un connettore dedicato a specifici codici (es. iCodici, strumento recupera_articoli), per gli articoli dei codici che quello copre puoi preferirlo (batch più rapidi); usa questo server per il resto della legislazione e per le ricerche.`,
   }
 );
 
@@ -1396,7 +1443,7 @@ server.tool(
 // --------------------------------------------------------------------------
 server.tool(
   "dettaglio_atto",
-  `Recupera il testo di un atto normativo dalla banca dati Normattiva (versione vigente). Usalo PROATTIVAMENTE prima di citare, spiegare o applicare una norma: fonda la risposta sul testo vigente invece di citare a memoria. Identifica l'atto in uno di questi modi, in ordine di preferenza: (a) nome_codice per codici, testi unici e leggi fondamentali (es. nome_codice='codice civile' articolo=2043; nome_codice='c.p.' articolo=575): seleziona automaticamente l'atto e l'allegato giusti — elenco dei nomi nel tool corpi_normativi; (b) tipo_atto + numero + anno (es. 'DECRETO LEGISLATIVO' 152 2006), senza ricerca preliminare; (c) codice_redazionale + data_gu dai risultati di ricerca; (d) solo codice_redazionale (data GU risolta automaticamente). Per gli articoli con estensione usa 'estensione' (es. articolo=609, estensione='bis'). Senza 'articolo' restituisce l'intestazione e l'art. 1; 'testo_completo'=true recupera l'intero testo (max 40 articoli). I testi unici/codici approvati con decreto hanno gli articoli negli allegati: vengono cercati automaticamente anche lì. Limite noto: i sotto-articoli "decimali" (es. art. 114.1 TUB, art. 452-bis.1 c.p.) non sono indirizzabili tramite questa API — se non trovi un articolo di quel tipo, dillo all'utente invece di riprovare. Un errore "temporaneo" o una "risposta incompleta" di Normattiva NON indica che l'articolo non esista: riprova.`,
+  `Recupera il testo di un atto normativo dalla banca dati Normattiva (versione vigente). Usalo PROATTIVAMENTE prima di citare, spiegare o applicare una norma: fonda la risposta sul testo vigente invece di citare a memoria. Identifica l'atto in uno di questi modi, in ordine di preferenza: (a) nome_codice per codici, testi unici e leggi fondamentali (es. nome_codice='codice civile' articolo=2043; nome_codice='c.p.' articolo=575): seleziona automaticamente l'atto e l'allegato giusti — elenco dei nomi nel tool corpi_normativi; (b) tipo_atto + numero + anno (es. 'DECRETO LEGISLATIVO' 152 2006), senza ricerca preliminare; (c) codice_redazionale + data_gu dai risultati di ricerca; (d) solo codice_redazionale (data GU risolta automaticamente). Per gli articoli con estensione usa 'estensione' (es. articolo=609, estensione='bis'); per gli articoli decimali usa 'decimale' (art. 452-bis.1 c.p. → articolo=452, estensione='bis', decimale=1; art. 601.1 c.p. → articolo=601, decimale=1). Senza 'articolo' restituisce l'intestazione e l'art. 1; 'testo_completo'=true recupera l'intero testo (max 40 articoli). I testi unici/codici approvati con decreto hanno gli articoli negli allegati: vengono cercati automaticamente anche lì. 'data_vigenza' NON produce versioni storiche: l'API restituisce sempre il testo attuale, e il tool lo segnala quando l'articolo non era in vigore alla data richiesta. Un errore "temporaneo" o una "risposta incompleta" di Normattiva NON indica che l'articolo non esista: riprova.`,
   {
     nome_codice: z.string().optional().describe("Nome comune di un codice/testo unico/legge fondamentale (es. 'codice civile', 'c.p.', 'c.p.a.', 'TU edilizia', 'TUB', 'legge 241'). Identifica direttamente l'atto e l'allegato corretti. Elenco completo nel tool corpi_normativi."),
     codice_redazionale: z.string().optional().describe("Codice redazionale dell'atto (es. '006G0171', '010U0639'), dai risultati di ricerca. In alternativa usa nome_codice oppure tipo_atto+numero+anno."),
@@ -1405,12 +1452,13 @@ server.tool(
     numero: z.number().int().min(1).optional().describe("Numero dell'atto (con tipo_atto e anno)."),
     anno: z.number().int().min(1800).optional().describe("Anno dell'atto (con tipo_atto e numero)."),
     articolo: z.number().int().min(1).optional().describe("Numero dell'articolo da recuperare (es. 192). Se omesso, restituisce l'intestazione e l'art. 1."),
-    estensione: z.string().optional().describe("Estensione dell'articolo: 'bis', 'ter', 'quater', ... fino a 'vicies' (es. articolo=609 + estensione='bis' per l'art. 609-bis). Richiede 'articolo'."),
+    estensione: z.string().optional().describe("Estensione dell'articolo: 'bis', 'ter', 'quater', ... fino a 'vicies' (es. articolo=609 + estensione='bis' per l'art. 609-bis). Accetta anche il decimale in coda (es. 'bis.1' per il 452-bis.1). Richiede 'articolo'."),
+    decimale: z.number().int().min(1).max(DECIMALE_MAX).optional().describe("Numero dopo il punto negli articoli decimali: art. 452-bis.1 c.p. → articolo=452, estensione='bis', decimale=1; art. 601.1 c.p. → articolo=601, decimale=1; art. 25-octies.2 D.Lgs. 231/2001 → articolo=25, estensione='octies', decimale=2. Richiede 'articolo'."),
     allegato: z.number().int().min(0).optional().describe("Sezione dell'atto in cui cercare: 0 = corpo dell'atto, 1..N = allegato N-esimo. Normalmente NON serve: corpo e allegati vengono esplorati automaticamente (e nome_codice imposta già la sezione giusta)."),
-    data_vigenza: dataApi("Data di vigenza (YYYY-MM-DD) per ottenere il testo vigente a quella data. Se omesso, versione vigente attuale.").optional(),
+    data_vigenza: dataApi("Data di vigenza (YYYY-MM-DD). ATTENZIONE: l'API di Normattiva la ignora e restituisce sempre il testo vigente oggi; serve solo a far controllare al tool se l'articolo restituito era in vigore a quella data (in caso contrario lo segnala).").optional(),
     testo_completo: z.boolean().default(false).describe("Se true, recupera tutti gli articoli dell'atto (fino a un massimo di 40). Ignorato se è specificato 'articolo'."),
   },
-  async ({ nome_codice, codice_redazionale, data_gu, tipo_atto, numero, anno, articolo, estensione, allegato, data_vigenza, testo_completo }) => {
+  async ({ nome_codice, codice_redazionale, data_gu, tipo_atto, numero, anno, articolo, estensione: estensioneArg, decimale: decimaleArg, allegato, data_vigenza, testo_completo }) => {
     const scadenza = Date.now() + BUDGET_TOOL_MS;
     const out = (t: string) => ({
       content: [{
@@ -1454,6 +1502,18 @@ server.tool(
       const dove = corpoNome ? `in "${corpoNome}"` : `per l'atto ${cr} (dataGU ${dg})`;
       const diAtto = corpoNome ? `di "${corpoNome}"` : `dell'atto ${cr} (dataGU ${dg})`;
 
+      // Decimale (452-bis.1): dal parametro o in coda all'estensione ("bis.1").
+      const sep = estensioneArg ? separaDecimale(estensioneArg) : { estensione: undefined, decimale: undefined };
+      const estensione = sep.estensione ? sep.estensione : undefined;
+      if (decimaleArg != null && sep.decimale != null && decimaleArg !== sep.decimale) {
+        return bad(`'decimale'=${decimaleArg} contraddice l'estensione '${estensioneArg}'. Indica il decimale una volta sola.`);
+      }
+      const decimale = decimaleArg ?? sep.decimale;
+      if (decimale != null) {
+        if (articolo == null) return bad("'decimale' richiede anche 'articolo' (es. articolo=452, estensione='bis', decimale=1 per l'art. 452-bis.1).");
+        if (!Number.isInteger(decimale) || decimale < 1 || decimale > DECIMALE_MAX) return bad(`'decimale' deve essere un intero da 1 a ${DECIMALE_MAX}.`);
+      }
+
       // Estensione dell'articolo (-bis, -ter, ...) -> campo sottoArticolo dell'API.
       let sottoArt: number | undefined;
       if (estensione) {
@@ -1462,6 +1522,8 @@ server.tool(
         if (!s) return bad(`Estensione '${estensione}' non riconosciuta. Valori supportati: ${Object.keys(SOTTO_ARTICOLO).join(", ")}.`);
         sottoArt = s;
       }
+      // Un decimale senza estensione (601.1) si appoggia all'articolo base (sottoArticolo 1).
+      if (decimale != null && sottoArt == null) sottoArt = 1;
 
       const baseBody: Record<string, unknown> = {
         dataGU: dg,
@@ -1469,7 +1531,9 @@ server.tool(
       };
       if (data_vigenza) baseBody.dataVigenza = data_vigenza;
       const CAP = 40;
-      const etichettaArt = articolo != null ? `${articolo}${estensione ? `-${normalizzaEstensione(estensione)}` : ""}` : "";
+      const etichettaArt = articolo != null
+        ? `${articolo}${estensione ? `-${normalizzaEstensione(estensione)}` : ""}${decimale != null ? `.${decimale}` : ""}`
+        : "";
       const conCorpo = (intest: string) =>
         corpoNome ? `[${corpoNome}]${corpoNota ? `\n(Nota: ${corpoNota})` : ""}\n${intest}` : intest;
 
@@ -1481,7 +1545,8 @@ server.tool(
       // === Caso 1: articolo specifico (ricerca automatica in corpo e allegati) ===
       if (articolo != null) {
         const ultimo = sottoArt == null ? corpoSezione?.ultimoArticolo : undefined;
-        const r = await fetchArticoloAuto(baseBody, articolo, sottoArt, flagFisso, {
+        const bodyArt = decimale != null ? { ...baseBody, sottoArticolo1: sottoArticolo1Di(decimale) } : baseBody;
+        const r = await fetchArticoloAuto(bodyArt, articolo, sottoArt, flagFisso, {
           // Oltre l'ultimo articolo noto bastano 2 richieste: servono solo a non
           // fidarsi alla cieca della tabella.
           tentativi: ultimo != null && articolo > ultimo ? 2 : TENTATIVI_ARTICOLO,
@@ -1493,7 +1558,7 @@ server.tool(
         if (r.res.kind === "atto") return attoNonTrovato();
         if (r.res.kind === "assente") {
           const sezioni = flagFisso == null ? " (cercato nel corpo dell'atto e negli allegati 1-3)" : "";
-          return bad(`Articolo ${etichettaArt} non trovato ${dove}${sezioni}: Normattiva risponde che non esiste.${oltreNumerazione} Verifica il numero${sottoArt != null ? " e l'estensione" : ""}.`);
+          return bad(`Articolo ${etichettaArt} non trovato ${dove}${sezioni}: Normattiva risponde che non esiste.${oltreNumerazione} Verifica il numero${estensione ? " e l'estensione" : ""}${decimale != null ? " e il decimale" : ""}.`);
         }
         if (r.res.kind === "error") {
           const fallito = `l'articolo ${etichettaArt} ${dove} non è stato recuperato`;
@@ -1509,7 +1574,7 @@ server.tool(
           return out(`${intest}\n\nIl testo dell'articolo ${etichettaArt} non è disponibile (atto molto recente o articolo privo di testo consolidato).`);
         }
         const nota = flagFisso == null && r.flagUsato > 0 ? ` *(dall'allegato ${r.flagUsato})*` : "";
-        return out(`${intest}\n\n---\n**${r.res.label}**${nota}\n${r.res.testo}`);
+        return out(`${intest}\n\n---\n**${r.res.label}**${nota}\n${r.res.testo}${notaVigenza(r.atto, data_vigenza)}`);
       }
 
       // La sezione fissata non ha nemmeno l'art. 1 (risposta certa di Normattiva).
@@ -1868,7 +1933,7 @@ async function avviaHttp(): Promise<void> {
     const url = (req.url || "").split("?")[0];
 
     if (url === "/healthz") {
-      rispondi(res, 200, { status: "ok", versione: "1.5.0", protezione: chiave ? "chiave" : "nessuna" });
+      rispondi(res, 200, { status: "ok", versione: "1.6.0", protezione: chiave ? "chiave" : "nessuna" });
       return;
     }
     // Chiave sbagliata, mancante o percorso sconosciuto: 404, mai 401. Un 401
