@@ -104,6 +104,32 @@ function limitaTesto(testo: string, comeRestringere: string): string {
 }
 
 /**
+ * Divide il testo di UN articolo in parti di al massimo `max` caratteri, per
+ * gli articoli che da soli superano il tetto (art. 9 D.Lgs. 47/2026: ~55.000
+ * caratteri con le note). Il taglio cade, in ordine di preferenza, su
+ * `confine` (es. l'inizio delle «Note all'art.»), su una riga vuota, a fine
+ * riga (fine di un comma o di una lettera), su uno spazio.
+ */
+function dividiInParti(testo: string, max: number, confine?: number): string[] {
+  const parti: string[] = [];
+  let inizio = 0;
+  while (testo.length - inizio > max) {
+    const finestra = testo.slice(inizio, inizio + max);
+    let taglio = -1;
+    if (confine != null && confine - inizio > max * 0.3 && confine - inizio <= max) taglio = confine - inizio;
+    if (taglio < 0) taglio = finestra.lastIndexOf("\n\n");
+    if (taglio < max * 0.5) taglio = finestra.lastIndexOf("\n");
+    if (taglio < max * 0.5) taglio = finestra.lastIndexOf(" ");
+    if (taglio <= 0) taglio = max;
+    parti.push(testo.slice(inizio, inizio + taglio).trimEnd());
+    inizio += taglio;
+    while (inizio < testo.length && /\s/.test(testo[inizio])) inizio++;
+  }
+  if (inizio < testo.length) parti.push(testo.slice(inizio));
+  return parti.length ? parti : [""];
+}
+
+/**
  * Messaggio leggibile per gli status HTTP ricorrenti dell'API Normattiva,
  * così Claude (e l'utente) sanno cosa fare invece di vedere un codice nudo.
  */
@@ -611,7 +637,9 @@ function spiegaErrore(e: ErroreApi, fallito: string, esistenza = "NON indica che
 }
 
 type ArticoloResult =
-  | { kind: "article"; label: string; testo: string; tentativi: number }
+  // `inizioNote`: posizione in `testo` delle «Note all'art.» redazionali della GU
+  // (blocco note-akn), se ci sono.
+  | { kind: "article"; label: string; testo: string; inizioNote?: number; tentativi: number }
   | { kind: "empty"; tentativi: number }
   // L'articolo (o la sezione) non c'è: 404 specifico, vedi classifica.
   | { kind: "assente"; tentativi: number }
@@ -625,27 +653,55 @@ type ArticoloResult =
  * quelli contenuti negli allegati/testi unici (classe "attachment-just-text",
  * dove il numero d'articolo è testo semplice, es. "Art. 3.").
  */
-function extractArticolo(html: string, idArticolo?: number): { label: string; testo: string } | null {
+/**
+ * Separa dall'HTML di un articolo il blocco delle «Note all'art.» (div
+ * note-akn): sono le note redazionali della Gazzetta che riportano i testi
+ * richiamati, e negli atti recenti possono pesare quanto l'articolo (art. 9
+ * D.Lgs. 47/2026: ~39.000 caratteri di testo + ~16.000 di note).
+ */
+function separaNote(html: string): { articolo: string; note: string } {
+  const inizio = html.search(/<div[^>]*class="note-akn"/i);
+  if (inizio < 0) return { articolo: html, note: "" };
+  // Fine del div: si contano i div annidati.
+  const re = /<\/?div\b[^>]*>/gi;
+  re.lastIndex = inizio;
+  let profondita = 0;
+  let fine = html.length;
+  for (let m = re.exec(html); m; m = re.exec(html)) {
+    profondita += m[0][1] === "/" ? -1 : 1;
+    if (profondita === 0) { fine = m.index + m[0].length; break; }
+  }
+  return { articolo: html.slice(0, inizio) + html.slice(fine), note: html.slice(inizio, fine) };
+}
+
+function extractArticolo(html: string, idArticolo?: number): { label: string; testo: string; inizioNote?: number } | null {
   const hasAkn = html.includes("article-num-akn");
   const hasAtt = html.includes("attachment-just-text");
   if (!hasAkn && !hasAtt) return null;
 
+  // Le note restano in coda al testo (come prima), ma se ne segna l'inizio.
+  const sep = separaNote(html);
+  const conNote = (label: string, testo: string) => {
+    const note = sep.note ? htmlToText(sep.note) : "";
+    return note ? { label, testo: `${testo}\n\n${note}`, inizioNote: testo.length } : { label, testo };
+  };
+
   if (hasAkn) {
-    const m = html.match(/article-num-akn[^>]*>([^<]+)</);
+    const m = sep.articolo.match(/article-num-akn[^>]*>([^<]+)</);
     const label = m ? m[1].trim() : (idArticolo != null ? `Art. ${idArticolo}` : "");
     // L'intestazione "Art. N" è già mostrata come label: rimuovila dal corpo.
-    const bodyHtml = html.replace(/<h2[^>]*article-num-akn[^>]*>[\s\S]*?<\/h2>/gi, "");
-    return { label, testo: htmlToText(bodyHtml) };
+    const bodyHtml = sep.articolo.replace(/<h2[^>]*article-num-akn[^>]*>[\s\S]*?<\/h2>/gi, "");
+    return conNote(label, htmlToText(bodyHtml));
   }
 
   // Allegato / testo unico: il numero d'articolo è testo semplice.
-  let testo = htmlToText(html);
+  let testo = htmlToText(sep.articolo);
   // Il suffisso ".N" copre gli articoli decimali (es. "Art. 452-bis.1").
   const m = testo.match(/Art(?:icolo)?\.?\s*\d+[\-A-Za-z]*(?:\.\d+)?/);
   const label = m ? m[0].replace(/\s+/g, " ").trim() : (idArticolo != null ? `Art. ${idArticolo}` : "Allegato");
   // Rimuovi il numero d'articolo se è a inizio testo (evita il doppione con la label).
   testo = testo.replace(new RegExp("^" + label.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") + "\\.?\\s*"), "").trim();
-  return { label, testo };
+  return conNote(label, testo);
 }
 
 /**
@@ -671,7 +727,7 @@ async function fetchDettaglioArticolo(
 
   const atto = e.data?.data?.atto ?? null;
   const ex = extractArticolo(atto?.articoloHtml ?? "", idArticolo);
-  if (ex) return { res: { kind: "article", label: ex.label, testo: ex.testo, tentativi: e.tentativi }, atto };
+  if (ex) return { res: { kind: "article", label: ex.label, testo: ex.testo, inizioNote: ex.inizioNote, tentativi: e.tentativi }, atto };
   return { res: { kind: "empty", tentativi: e.tentativi }, atto };
 }
 
@@ -957,6 +1013,138 @@ async function resolveAtto(p: {
   }
 
   return { error: "Identifica l'atto con 'codice_redazionale' (più 'data_gu' se disponibile) oppure con 'tipo_atto' + 'numero' + 'anno'." };
+}
+
+// ============================================================================
+// AGGIORNAMENTI ALL'ARTICOLO (dal sito normattiva.it, non dall'API)
+// ============================================================================
+//
+// L'API Open Data non dice quale atto ha modificato un articolo. Il sito sì,
+// nella finestra «aggiornamenti all'articolo»:
+//     /do/atto/vediAggiornamentiAllArticolo?art.dataPubblicazioneGazzetta=...
+// Verificato l'8/11/2026:
+//  - la finestra risponde solo se nella STESSA sessione è stato aperto l'atto
+//    (/atto/caricaDettaglioAtto con codice redazionale e data GU); altrimenti
+//    restituisce la pagina «Errore nel caricamento delle informazioni». Il
+//    cookie della home non basta; la sessione ricorda più atti aperti;
+//  - gli identificativi sono quelli dei link caricaArticolo: idSottoArticolo
+//    1 = base, 2 = bis, ...; idSottoArticolo1 10 = base, 20 = ".1", ...;
+//  - zero righe sia per un articolo mai modificato sia per uno inesistente:
+//    l'esistenza va verificata prima con l'API;
+//  - le date sono quelle di pubblicazione in GU dell'atto modificativo, non
+//    di vigenza della modifica.
+// È HTML del sito: se cambia la grafica, il parser smette di trovare la
+// tabella e il tool lo dichiara (lo smoke test settimanale se ne accorge).
+
+const SITE_BASE = process.env.NORMATTIVA_SITE_BASE || "https://www.normattiva.it";
+const SITE_HEADERS: Record<string, string> = { "Accept": "text/html", "User-Agent": "NormattivaMCP/1.0" };
+
+// Cookie di sessione del sito e atti già aperti in quella sessione.
+const cookieSito = new Map<string, string>();
+const attiApertiSito = new Map<string, number>();
+const SESSIONE_SITO_MS = 20 * 60_000;
+
+type EsitoSito = { ok: true; html: string } | { ok: false; motivo: string };
+
+async function siteGet(percorso: string, scadenza: number): Promise<EsitoSito> {
+  const resta = scadenza - Date.now();
+  if (resta < MIN_RICHIESTA_MS) return { ok: false, motivo: "tempo a disposizione esaurito" };
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), Math.min(FETCH_TIMEOUT_MS, resta));
+  try {
+    const cookie = [...cookieSito].map(([k, v]) => `${k}=${v}`).join("; ");
+    const r = await fetch(`${SITE_BASE}${percorso}`, {
+      headers: cookie ? { ...SITE_HEADERS, Cookie: cookie } : SITE_HEADERS,
+      signal: ctrl.signal,
+    });
+    for (const c of r.headers.getSetCookie?.() ?? []) {
+      const kv = c.split(";")[0];
+      const i = kv.indexOf("=");
+      if (i > 0) cookieSito.set(kv.slice(0, i).trim(), kv.slice(i + 1).trim());
+    }
+    const html = await r.text();
+    if (r.status === 409 || r.status === 429 || /bloccata dai sistemi di protezione/i.test(html)) {
+      return { ok: false, motivo: `HTTP ${r.status}: richiesta bloccata dai sistemi di protezione del sito (anti-bot)` };
+    }
+    if (r.status !== 200) return { ok: false, motivo: `HTTP ${r.status}` };
+    return { ok: true, html };
+  } catch (e) {
+    return { ok: false, motivo: ctrl.signal.aborted ? "il sito non ha risposto in tempo" : `errore di rete: ${e instanceof Error ? e.message : String(e)}` };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+type Aggiornamento = {
+  progressivo: string;
+  dataGU: string;            // gg/mm/aaaa, pubblicazione dell'atto modificativo
+  atto: string;              // es. "Il DECRETO LEGISLATIVO 12 giugno 2026, n. 115 (in G.U. 01/07/2026, n.150)"
+  disposizioni: { testo: string; codiceRedazionale?: string; dataGU?: string; articolo?: number; sottoArticolo?: number; flag?: number }[];
+};
+
+/** Legge la tabella della finestra «aggiornamenti all'articolo»; null se la tabella non c'è. */
+function parseAggiornamenti(html: string): Aggiornamento[] | null {
+  if (!/tabella_elencoAgg/.test(html)) return null;
+  const corpo = html.match(/<tbody>([\s\S]*?)<\/tbody>/i)?.[1] ?? "";
+  const pulisci = (s: string) => htmlToText(s).replace(/\s+/g, " ").trim();
+  const righe: Aggiornamento[] = [];
+  for (const tr of corpo.match(/<tr>[\s\S]*?<\/tr>/gi) ?? []) {
+    const celle = [...tr.matchAll(/<td[^>]*>([\s\S]*?)<\/td>/gi)].map((m) => m[1]);
+    if (celle.length < 3) continue;
+    const voci = [...celle[2].matchAll(/<li[^>]*>([\s\S]*?)<\/li>/gi)].map((m) => m[1]);
+    const atto = voci.filter((v) => !/<a\b/i.test(v)).map(pulisci).join("; ");
+    const disposizioni = voci.filter((v) => /<a\b/i.test(v)).map((v) => {
+      const href = (v.match(/href="([^"]*)"/i)?.[1] ?? "").replace(/&amp;/g, "&");
+      const q = new URLSearchParams(href.split("?")[1] ?? "");
+      const num = (k: string) => (q.get(k) != null && /^\d+$/.test(q.get(k)!) ? Number(q.get(k)) : undefined);
+      return {
+        testo: pulisci(v),
+        codiceRedazionale: q.get("atto.codiceRedazionale") ?? undefined,
+        dataGU: q.get("atto.dataPubblicazioneGazzetta") ?? undefined,
+        articolo: num("atto.articolo.numero"),
+        sottoArticolo: num("atto.articolo.sottoArticolo"),
+        flag: num("atto.articolo.tipoArticolo"),
+      };
+    });
+    righe.push({ progressivo: pulisci(celle[0]), dataGU: pulisci(celle[1]), atto, disposizioni });
+  }
+  return righe;
+}
+
+/**
+ * Aggiornamenti di un articolo dal sito. `sottoArticolo` 1 = base, 2 = bis...;
+ * `sottoArticolo1` 10 = base, 20 = ".1"... Apre l'atto nella sessione se serve
+ * e, se il sito ha dimenticato la sessione, la riapre una volta.
+ */
+async function fetchAggiornamentiArticolo(
+  cr: string, dg: string, flag: number, articolo: number, sottoArticolo: number, sottoArticolo1: number, scadenza: number,
+): Promise<{ ok: true; righe: Aggiornamento[] } | { ok: false; motivo: string }> {
+  const chiave = `AGG ${cr} ${dg} ${flag} ${articolo} ${sottoArticolo} ${sottoArticolo1}`;
+  const hit = cacheGet(chiave) as Aggiornamento[] | undefined;
+  if (hit) return { ok: true, righe: hit };
+  const finestra = `/do/atto/vediAggiornamentiAllArticolo?art.dataPubblicazioneGazzetta=${encodeURIComponent(`${dg} 00:00:00.0`)}` +
+    `&art.codiceRedazionale=${encodeURIComponent(cr)}&art.flagTipoArticolo=${flag}&art.idArticolo=${articolo}` +
+    `&art.idSottoArticolo=${sottoArticolo}&art.idSottoArticolo1=${sottoArticolo1}&art.versione=1`;
+  for (let giro = 0; giro < 2; giro++) {
+    const chiaveAtto = `${cr}|${dg}`;
+    const aperto = attiApertiSito.get(chiaveAtto);
+    if (giro > 0 || aperto == null || Date.now() - aperto > SESSIONE_SITO_MS) {
+      const a = await siteGet(`/atto/caricaDettaglioAtto?atto.dataPubblicazioneGazzetta=${dg}&atto.codiceRedazionale=${encodeURIComponent(cr)}`, scadenza);
+      if (!a.ok) return { ok: false, motivo: `apertura dell'atto sul sito: ${a.motivo}` };
+      attiApertiSito.set(chiaveAtto, Date.now());
+    }
+    const f = await siteGet(finestra, scadenza);
+    if (!f.ok) return { ok: false, motivo: f.motivo };
+    const righe = parseAggiornamenti(f.html);
+    if (righe) {
+      cacheSet(chiave, righe, 6 * 3_600_000);
+      return { ok: true, righe };
+    }
+    // «Errore nel caricamento»: sessione scaduta o atto non aperto → riapri una volta.
+    attiApertiSito.delete(chiaveAtto);
+    if (!/Errore nel caricamento/i.test(f.html)) return { ok: false, motivo: "la pagina del sito non contiene la tabella degli aggiornamenti (struttura cambiata?)" };
+  }
+  return { ok: false, motivo: "il sito risponde «Errore nel caricamento delle informazioni» anche dopo aver riaperto l'atto" };
 }
 
 // ============================================================================
@@ -1268,7 +1456,7 @@ function creaServer(): McpServer {
 const server = new McpServer(
   {
     name: "normattiva",
-    version: "1.6.0",
+    version: "1.7.0",
   },
   {
     instructions: `Server MCP per la normativa italiana (banca dati ufficiale Normattiva). I testi restituiti sono nella versione vigente oggi: l'API di Normattiva ignora data_vigenza (verificato a novembre 2026), e dettaglio_atto segnala quando l'articolo restituito non era in vigore alla data richiesta.
@@ -1280,6 +1468,7 @@ Come scegliere lo strumento:
 2. Atto identificato da una citazione (es. D.Lgs. 152/2006, L. 241/1990): dettaglio_atto con tipo_atto + numero + anno (+articolo). Nessuna ricerca preliminare necessaria.
 3. Ricerca tematica o atto non identificato: ricerca_semplice o ricerca_avanzata, poi dettaglio_atto con codice_redazionale + data_gu presi dai risultati.
 4. Novità e modifiche normative in un periodo: atti_aggiornati.
+5. Da quale atto viene un comma o una lettera, o la storia delle modifiche di un articolo: aggiornamenti_articolo (stessi parametri di dettaglio_atto).
 I codici e i testi unici approvati con decreto (codice civile, penale, ecc.) hanno gli articoli negli allegati dell'atto: dettaglio_atto li gestisce automaticamente (nome_codice seleziona già l'allegato giusto).
 
 ERRORI TEMPORANEI: Normattiva a volte risponde con un errore generico anche per testi che esistono (il server ritenta già più volte). Se un tool segnala un errore temporaneo o una risposta incompleta, NON concludere che l'articolo o l'atto non esistano e non citarli a memoria: riprova dopo qualche secondo e, se l'errore persiste, dichiara all'utente che il testo non è stato recuperato. Se un tool segnala un blocco delle richieste (anti-bot), attendi almeno mezzo minuto prima di riprovare e non lanciare richieste in parallelo.
@@ -1443,7 +1632,7 @@ server.tool(
 // --------------------------------------------------------------------------
 server.tool(
   "dettaglio_atto",
-  `Recupera il testo di un atto normativo dalla banca dati Normattiva (versione vigente). Usalo PROATTIVAMENTE prima di citare, spiegare o applicare una norma: fonda la risposta sul testo vigente invece di citare a memoria. Identifica l'atto in uno di questi modi, in ordine di preferenza: (a) nome_codice per codici, testi unici e leggi fondamentali (es. nome_codice='codice civile' articolo=2043; nome_codice='c.p.' articolo=575): seleziona automaticamente l'atto e l'allegato giusti — elenco dei nomi nel tool corpi_normativi; (b) tipo_atto + numero + anno (es. 'DECRETO LEGISLATIVO' 152 2006), senza ricerca preliminare; (c) codice_redazionale + data_gu dai risultati di ricerca; (d) solo codice_redazionale (data GU risolta automaticamente). Per gli articoli con estensione usa 'estensione' (es. articolo=609, estensione='bis'); per gli articoli decimali usa 'decimale' (art. 452-bis.1 c.p. → articolo=452, estensione='bis', decimale=1; art. 601.1 c.p. → articolo=601, decimale=1). Senza 'articolo' restituisce l'intestazione e l'art. 1; 'testo_completo'=true recupera l'intero testo (max 40 articoli). I testi unici/codici approvati con decreto hanno gli articoli negli allegati: vengono cercati automaticamente anche lì. 'data_vigenza' NON produce versioni storiche: l'API restituisce sempre il testo attuale, e il tool lo segnala quando l'articolo non era in vigore alla data richiesta. Un errore "temporaneo" o una "risposta incompleta" di Normattiva NON indica che l'articolo non esista: riprova.`,
+  `Recupera il testo di un atto normativo dalla banca dati Normattiva (versione vigente). Usalo PROATTIVAMENTE prima di citare, spiegare o applicare una norma: fonda la risposta sul testo vigente invece di citare a memoria. Identifica l'atto in uno di questi modi, in ordine di preferenza: (a) nome_codice per codici, testi unici e leggi fondamentali (es. nome_codice='codice civile' articolo=2043; nome_codice='c.p.' articolo=575): seleziona automaticamente l'atto e l'allegato giusti — elenco dei nomi nel tool corpi_normativi; (b) tipo_atto + numero + anno (es. 'DECRETO LEGISLATIVO' 152 2006), senza ricerca preliminare; (c) codice_redazionale + data_gu dai risultati di ricerca; (d) solo codice_redazionale (data GU risolta automaticamente). Per gli articoli con estensione usa 'estensione' (es. articolo=609, estensione='bis'); per gli articoli decimali usa 'decimale' (art. 452-bis.1 c.p. → articolo=452, estensione='bis', decimale=1; art. 601.1 c.p. → articolo=601, decimale=1). Un articolo troppo lungo per un solo risultato arriva diviso in parti: la risposta lo dice, e parte=2, 3, ... dà il seguito; note=false esclude le «Note all'art.» della Gazzetta. Senza 'articolo' restituisce l'intestazione e l'art. 1; 'testo_completo'=true recupera l'intero testo (max 40 articoli). I testi unici/codici approvati con decreto hanno gli articoli negli allegati: vengono cercati automaticamente anche lì. 'data_vigenza' NON produce versioni storiche: l'API restituisce sempre il testo attuale, e il tool lo segnala quando l'articolo non era in vigore alla data richiesta. Un errore "temporaneo" o una "risposta incompleta" di Normattiva NON indica che l'articolo non esista: riprova.`,
   {
     nome_codice: z.string().optional().describe("Nome comune di un codice/testo unico/legge fondamentale (es. 'codice civile', 'c.p.', 'c.p.a.', 'TU edilizia', 'TUB', 'legge 241'). Identifica direttamente l'atto e l'allegato corretti. Elenco completo nel tool corpi_normativi."),
     codice_redazionale: z.string().optional().describe("Codice redazionale dell'atto (es. '006G0171', '010U0639'), dai risultati di ricerca. In alternativa usa nome_codice oppure tipo_atto+numero+anno."),
@@ -1457,8 +1646,10 @@ server.tool(
     allegato: z.number().int().min(0).optional().describe("Sezione dell'atto in cui cercare: 0 = corpo dell'atto, 1..N = allegato N-esimo. Normalmente NON serve: corpo e allegati vengono esplorati automaticamente (e nome_codice imposta già la sezione giusta)."),
     data_vigenza: dataApi("Data di vigenza (YYYY-MM-DD). ATTENZIONE: l'API di Normattiva la ignora e restituisce sempre il testo vigente oggi; serve solo a far controllare al tool se l'articolo restituito era in vigore a quella data (in caso contrario lo segnala).").optional(),
     testo_completo: z.boolean().default(false).describe("Se true, recupera tutti gli articoli dell'atto (fino a un massimo di 40). Ignorato se è specificato 'articolo'."),
+    parte: z.number().int().min(1).optional().describe("Per un articolo troppo lungo per un solo risultato: la risposta dice in quante parti è diviso, e parte=2, 3, ... restituisce il seguito (stessi altri parametri). Richiede 'articolo'."),
+    note: z.boolean().default(true).describe("Se false, esclude le «Note all'art.» redazionali della Gazzetta Ufficiale (testi delle norme richiamate, in coda agli articoli degli atti recenti). Vale con 'articolo'."),
   },
-  async ({ nome_codice, codice_redazionale, data_gu, tipo_atto, numero, anno, articolo, estensione: estensioneArg, decimale: decimaleArg, allegato, data_vigenza, testo_completo }) => {
+  async ({ nome_codice, codice_redazionale, data_gu, tipo_atto, numero, anno, articolo, estensione: estensioneArg, decimale: decimaleArg, allegato, data_vigenza, testo_completo, parte, note }) => {
     const scadenza = Date.now() + BUDGET_TOOL_MS;
     const out = (t: string) => ({
       content: [{
@@ -1509,6 +1700,7 @@ server.tool(
         return bad(`'decimale'=${decimaleArg} contraddice l'estensione '${estensioneArg}'. Indica il decimale una volta sola.`);
       }
       const decimale = decimaleArg ?? sep.decimale;
+      if (parte != null && articolo == null) return bad("'parte' richiede anche 'articolo': divide in parti un singolo articolo troppo lungo.");
       if (decimale != null) {
         if (articolo == null) return bad("'decimale' richiede anche 'articolo' (es. articolo=452, estensione='bis', decimale=1 per l'art. 452-bis.1).");
         if (!Number.isInteger(decimale) || decimale < 1 || decimale > DECIMALE_MAX) return bad(`'decimale' deve essere un intero da 1 a ${DECIMALE_MAX}.`);
@@ -1574,7 +1766,22 @@ server.tool(
           return out(`${intest}\n\nIl testo dell'articolo ${etichettaArt} non è disponibile (atto molto recente o articolo privo di testo consolidato).`);
         }
         const nota = flagFisso == null && r.flagUsato > 0 ? ` *(dall'allegato ${r.flagUsato})*` : "";
-        return out(`${intest}\n\n---\n**${r.res.label}**${nota}\n${r.res.testo}${notaVigenza(r.atto, data_vigenza)}`);
+        const vig = notaVigenza(r.atto, data_vigenza);
+        const haNote = r.res.inizioNote != null;
+        const testoArt = !note && haNote ? r.res.testo.slice(0, r.res.inizioNote).trimEnd() : r.res.testo;
+        const senzaNote = !note && haNote ? "\n\n*«Note all'art.» della Gazzetta escluse (note=false).*" : "";
+        // Un articolo oltre il tetto si divide in parti (parametro `parte`),
+        // invece di troncarlo senza modo di leggere il seguito.
+        const fisso = intest.length + r.res.label.length + nota.length + vig.length + senzaNote.length + 600;
+        const parti = dividiInParti(testoArt, Math.max(1_000, MAX_RISPOSTA_CHAR - fisso), note && haNote ? r.res.inizioNote : undefined);
+        const n = parte ?? 1;
+        if (n > parti.length) {
+          return bad(`L'articolo ${etichettaArt} ${dove} ${parti.length === 1 ? "sta in una sola parte" : `ha ${parti.length} parti`}${!note && haNote ? " (senza le note)" : ""}: parte=${n} non esiste.`);
+        }
+        if (parti.length === 1) return out(`${intest}\n\n---\n**${r.res.label}**${nota}\n${parti[0]}${vig}${senzaNote}`);
+        const seguito = n < parti.length ? `Per il seguito richiama dettaglio_atto con gli stessi parametri e parte=${n + 1}.` : "È l'ultima parte.";
+        const suggNote = note && haNote ? " Se bastano le disposizioni, note=false esclude le «Note all'art.» della Gazzetta (testi richiamati)." : "";
+        return out(`${intest}\n\n---\n**${r.res.label}**${nota} — parte ${n} di ${parti.length}\n${parti[n - 1]}\n\n---\n*Articolo lungo: questa è la parte ${n} di ${parti.length}. ${seguito}${suggNote}*${vig}${senzaNote}`);
       }
 
       // La sezione fissata non ha nemmeno l'art. 1 (risposta certa di Normattiva).
@@ -1706,6 +1913,106 @@ server.tool(
       return out(`${intest}\n\n---\n**${a1art.label}**\n${a1art.testo}\n\n---\n*L'atto contiene più articoli. Usa \`articolo=N\` per un articolo specifico (es. \`articolo=2\`), oppure \`testo_completo=true\` per l'intero testo.*`);
     } catch (error) {
       return bad(`Errore nel recupero del dettaglio: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+);
+
+// --------------------------------------------------------------------------
+// TOOL: aggiornamenti_articolo
+// --------------------------------------------------------------------------
+server.tool(
+  "aggiornamenti_articolo",
+  `Elenca gli atti che hanno introdotto o modificato un articolo (la finestra «aggiornamenti all'articolo» di normattiva.it): per ogni modifica l'atto modificativo, la data della sua pubblicazione in Gazzetta Ufficiale, la disposizione che la opera e cosa cambia (es. «l'introduzione della lettera c-bis) all'art. 25-quinquies, comma 1»). Usalo per sapere da quale atto viene un comma o una lettera, o per ricostruire la storia di un articolo. L'articolo si identifica come in dettaglio_atto (nome_codice oppure tipo_atto+numero+anno oppure codice_redazionale, più articolo/estensione/decimale). Le date sono di PUBBLICAZIONE in GU, non di vigenza della modifica: per la decorrenza leggi l'articolo dell'atto modificativo con dettaglio_atto (codice_redazionale, data_gu e articolo sono indicati per ogni voce). Fonte: il sito normattiva.it (l'API Open Data non espone queste informazioni).`,
+  {
+    nome_codice: z.string().optional().describe("Nome comune di un codice/testo unico/legge fondamentale (es. 'c.p.', '231/2001'), come in dettaglio_atto."),
+    codice_redazionale: z.string().optional().describe("Codice redazionale dell'atto, dai risultati di ricerca."),
+    data_gu: dataApi("Data di pubblicazione in GU dell'atto (YYYY-MM-DD). Se omessa viene risolta automaticamente.").optional(),
+    tipo_atto: z.string().optional().describe("Tipo di atto (es. 'DECRETO LEGISLATIVO'), con 'numero' e 'anno'."),
+    numero: z.number().int().min(1).optional().describe("Numero dell'atto (con tipo_atto e anno)."),
+    anno: z.number().int().min(1800).optional().describe("Anno dell'atto (con tipo_atto e numero)."),
+    articolo: z.number().int().min(1).describe("Numero dell'articolo."),
+    estensione: z.string().optional().describe("Estensione: 'bis', 'ter', ... (anche con il decimale in coda, es. 'bis.1')."),
+    decimale: z.number().int().min(1).max(DECIMALE_MAX).optional().describe("Numero dopo il punto negli articoli decimali (es. 601.1 → articolo=601, decimale=1)."),
+    allegato: z.number().int().min(0).optional().describe("Sezione dell'atto: 0 = corpo, N = allegato N-esimo. Normalmente non serve."),
+  },
+  async ({ nome_codice, codice_redazionale, data_gu, tipo_atto, numero, anno, articolo, estensione: estensioneArg, decimale: decimaleArg, allegato }) => {
+    const scadenza = Date.now() + BUDGET_TOOL_MS;
+    const bad = (t: string) => ({ content: [{ type: "text" as const, text: t }], isError: true });
+    try {
+      let cr: string;
+      let dg: string;
+      let flagFisso: number | undefined = allegato ?? undefined;
+      let nomeAtto: string | undefined;
+      if (nome_codice) {
+        const m = trovaCorpoNormativo(nome_codice);
+        if ("error" in m) return bad(m.error);
+        cr = m.corpo.codice;
+        dg = m.corpo.dataGU;
+        if (flagFisso == null) flagFisso = m.corpo.flag;
+        nomeAtto = `${m.corpo.nome} — ${m.corpo.riferimento}`;
+      } else {
+        const resolved = await resolveAtto({ codice_redazionale, data_gu, tipo_atto, numero, anno }, scadenza);
+        if ("error" in resolved) return bad(resolved.error);
+        cr = resolved.codiceRedazionale;
+        dg = resolved.dataGU;
+      }
+
+      const sep = estensioneArg ? separaDecimale(estensioneArg) : { estensione: undefined, decimale: undefined };
+      const estensione = sep.estensione || undefined;
+      if (decimaleArg != null && sep.decimale != null && decimaleArg !== sep.decimale) {
+        return bad(`'decimale'=${decimaleArg} contraddice l'estensione '${estensioneArg}'. Indica il decimale una volta sola.`);
+      }
+      const decimale = decimaleArg ?? sep.decimale;
+      if (decimale != null && (decimale < 1 || decimale > DECIMALE_MAX)) return bad(`'decimale' deve essere un intero da 1 a ${DECIMALE_MAX}.`);
+      let sottoArt = 1;
+      if (estensione) {
+        const s = SOTTO_ARTICOLO[normalizzaEstensione(estensione)];
+        if (!s) return bad(`Estensione '${estensione}' non riconosciuta. Valori supportati: ${Object.keys(SOTTO_ARTICOLO).join(", ")}.`);
+        sottoArt = s;
+      }
+      const etichetta = `${articolo}${estensione ? `-${normalizzaEstensione(estensione)}` : ""}${decimale != null ? `.${decimale}` : ""}`;
+      const dove = nomeAtto ? `in "${nomeAtto}"` : `per l'atto ${cr} (dataGU ${dg})`;
+
+      // 1. Con l'API: l'articolo esiste? In quale sezione? (Il sito dà zero
+      //    righe anche per un articolo inesistente.)
+      const body: Record<string, unknown> = { dataGU: dg, codiceRedazionale: cr };
+      if (decimale != null) body.sottoArticolo1 = sottoArticolo1Di(decimale);
+      const r = await fetchArticoloAuto(body, articolo, estensione || decimale != null ? sottoArt : undefined, flagFisso, { tentativi: TENTATIVI_ARTICOLO, scadenza });
+      if (r.res.kind === "atto") return bad(`Atto non trovato su Normattiva: il codice redazionale ${cr} con data GU ${dg} non individua alcun atto.`);
+      if (r.res.kind === "assente") return bad(`Articolo ${etichetta} non trovato ${dove}: Normattiva risponde che non esiste. Verifica il numero${estensione ? " e l'estensione" : ""}${decimale != null ? " e il decimale" : ""}.`);
+      if (r.res.kind === "error") return bad(spiegaErrore(r.res, `l'articolo ${etichetta} ${dove} non è stato verificato`, "NON indica che l'articolo non esista."));
+
+      // 2. Dal sito: la finestra degli aggiornamenti.
+      const agg = await fetchAggiornamentiArticolo(cr, dg, r.flagUsato, articolo, sottoArt, decimale != null ? sottoArticolo1Di(decimale) : 10, scadenza);
+      const titolo = r.atto?.titolo ? `${r.atto.titolo}` : `atto ${cr}`;
+      const label = r.res.kind === "article" ? r.res.label : `Art. ${etichetta}`;
+      const intest = `**Aggiornamenti all'articolo — ${label}**\n${nomeAtto ?? titolo}\nCodice redazionale: ${cr} — dataGU: ${dg}${r.flagUsato > 0 ? ` — allegato ${r.flagUsato}` : ""}`;
+      if (!agg.ok) {
+        return bad(`${intest}\n\n⚠️ L'elenco degli aggiornamenti non è stato recuperato dal sito normattiva.it (${agg.motivo}). L'articolo esiste (verificato con l'API). Riprova tra qualche istante; se l'errore persiste, dichiara all'utente che la provenienza delle modifiche non è stata verificata, senza ricostruirla a memoria.`);
+      }
+      if (agg.righe.length === 0) {
+        return { content: [{ type: "text" as const, text: `${intest}\n\nNormattiva non registra aggiornamenti per questo articolo: risulta nel testo originario dell'atto.` }] };
+      }
+      const estDi = (s?: number) => (s != null && s > 1 ? `-${Object.keys(SOTTO_ARTICOLO).find((k) => SOTTO_ARTICOLO[k] === s) ?? s}` : "");
+      let o = `${intest}\n\n${agg.righe.length} aggiornament${agg.righe.length === 1 ? "o" : "i"} (dal più vecchio):\n`;
+      for (const a of agg.righe) {
+        o += `\n${a.progressivo}. GU ${a.dataGU} — ${a.atto}`;
+        for (const d of a.disposizioni) {
+          o += `\n   - ${d.testo}`;
+          // Il numero d'articolo si prende dal testo («con l'art. 5»): il link
+          // del sito a volte punta all'art. 1 (L. 228/2003, verificato l'8/11/2026).
+          const mt = d.testo.match(/con l'art\.\s*(\d+)(?:-([a-z]+))?/i);
+          const artMod = mt ? Number(mt[1]) : d.articolo;
+          const estMod = mt ? (mt[2]?.toLowerCase() ?? "") : estDi(d.sottoArticolo).slice(1);
+          if (d.codiceRedazionale && d.dataGU && artMod != null) {
+            o += `\n     ↳ testo della disposizione: dettaglio_atto(codice_redazionale="${d.codiceRedazionale}", data_gu="${d.dataGU}", articolo=${artMod}${estMod ? `, estensione="${estMod}"` : ""})`;
+          }
+        }
+      }
+      o += `\n\n---\n*Fonte: normattiva.it, «aggiornamenti all'articolo». Le date sono di pubblicazione in GU dell'atto modificativo, non di vigenza della modifica: per la decorrenza leggi la disposizione indicata.*`;
+      return { content: [{ type: "text" as const, text: limitaTesto(o, "Elenco troppo lungo: chiedi a Normattiva dal sito.") }] };
+    } catch (error) {
+      return bad(`Errore nel recupero degli aggiornamenti: ${error instanceof Error ? error.message : String(error)}`);
     }
   }
 );
@@ -1933,7 +2240,7 @@ async function avviaHttp(): Promise<void> {
     const url = (req.url || "").split("?")[0];
 
     if (url === "/healthz") {
-      rispondi(res, 200, { status: "ok", versione: "1.6.0", protezione: chiave ? "chiave" : "nessuna" });
+      rispondi(res, 200, { status: "ok", versione: "1.7.0", protezione: chiave ? "chiave" : "nessuna" });
       return;
     }
     // Chiave sbagliata, mancante o percorso sconosciuto: 404, mai 401. Un 401

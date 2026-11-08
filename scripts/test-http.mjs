@@ -85,9 +85,9 @@ try {
   const url = new URL(`${BASE}/mcp/${CHIAVE}`);
   const client = new Client({ name: "test-http", version: "1.0.0" });
   await client.connect(new StreamableHTTPClientTransport(url));
-  verifica("initialize con la chiave", client.getServerVersion()?.version === "1.6.0", JSON.stringify(client.getServerVersion()));
+  verifica("initialize con la chiave", client.getServerVersion()?.version === "1.7.0", JSON.stringify(client.getServerVersion()));
   const { tools } = await client.listTools();
-  verifica("8 tool", tools.length === 8, `(${tools.length})`);
+  verifica("9 tool", tools.length === 9, `(${tools.length})`);
   const col = await client.callTool({ name: "collezioni_predefinite", arguments: {} });
   verifica("tools/call arriva al finto Normattiva", col.content?.[0]?.text?.includes("Atti di prova"), JSON.stringify(col).slice(0, 200));
   await client.close();
@@ -98,7 +98,7 @@ try {
     body: JSON.stringify({ jsonrpc: "2.0", id: 2, method: "tools/list", params: {} }),
   });
   const j26 = r26.ok ? await r26.json() : null;
-  verifica("header di protocollo 2026-07-28 accettato", r26.status === 200 && j26?.result?.tools?.length === 8, `(status ${r26.status})`);
+  verifica("header di protocollo 2026-07-28 accettato", r26.status === 200 && j26?.result?.tools?.length === 9, `(status ${r26.status})`);
 
   const due = await Promise.all([1, 2].map(async (n) => {
     const c = new Client({ name: `parallelo-${n}`, version: "1.0.0" });
