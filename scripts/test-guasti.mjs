@@ -86,6 +86,33 @@ const imposta = (chiave, ...risposte) => { copione.set(chiave, risposte); chiama
 const conta = (chiave) => chiamate.get(chiave) ?? 0;
 const sospese = new Set();
 
+// Finto sito normattiva.it: la finestra degli aggiornamenti risponde solo se
+// nella sessione (cookie) è stato aperto l'atto, come il sito vero.
+const sitoAperti = new Set();          // "sessione|codice"
+const sitoAgg = new Map();             // "codice|art|sa|sa1" → righe HTML
+const sitoLog = [];                    // percorsi richiesti, in ordine
+let sitoSessioni = 0;
+let sitoRotto = false;                 // simula un cambio di grafica
+const ERRORE_SITO = "<html><body>Errore nel caricamento delle informazioni</body></html>";
+const rigaAgg = (n, data, atto, link, testo) =>
+  `<tr><td style="width: 4em;"><br>${n} </td><td class="sinistra"><br>${data}</td><td class="destra"><ul><li>${atto}</li>` +
+  `<li style="list-style-type:square;"><a href="/atto/caricaDettaglioAtto?${link}">${testo}</a></li></ul></td></tr>`;
+const paginaAgg = (righe) => `<div id="corpo_elencoAgg"><table class="tabella_elencoAgg"><thead><tr><th>Progr.</th></tr></thead><tbody>${righe}</tbody></table></div>`;
+function rispondiSito(req) {
+  const url = new URL(req.url, "http://x");
+  sitoLog.push(url.pathname + url.search);
+  const sid = /JSESSIONID=([^;]+)/.exec(req.headers.cookie ?? "")?.[1];
+  if (url.pathname === "/atto/caricaDettaglioAtto") {
+    const nuova = sid ?? `s${++sitoSessioni}`;
+    sitoAperti.add(`${nuova}|${url.searchParams.get("atto.codiceRedazionale")}`);
+    return { status: 200, raw: "<html>atto</html>", cookie: `JSESSIONID=${nuova}; Path=/` };
+  }
+  const p = (k) => url.searchParams.get(`art.${k}`);
+  if (!sid || !sitoAperti.has(`${sid}|${p("codiceRedazionale")}`)) return { status: 200, raw: ERRORE_SITO };
+  if (sitoRotto) return { status: 200, raw: "<html><body>nuova grafica</body></html>" };
+  return { status: 200, raw: paginaAgg(sitoAgg.get(`${p("codiceRedazionale")}|${p("idArticolo")}|${p("idSottoArticolo")}|${p("idSottoArticolo1")}`) ?? "") };
+}
+
 const server = http.createServer((req, res) => {
   let dati = "";
   req.on("data", (c) => (dati += c));
@@ -113,6 +140,8 @@ const server = http.createServer((req, res) => {
         const a = atti[`${body.denominazioneAtto}|${body.numeroProvvedimento}|${body.annoProvvedimento}`];
         r = { status: 200, body: { listaAtti: a ? [a] : [], numeroAttiTrovati: a ? 1 : 0, paginaCorrente: 1, numeroPagine: 1 } };
       }
+    } else if (req.url.startsWith("/atto/caricaDettaglioAtto") || req.url.startsWith("/do/atto/vediAggiornamentiAllArticolo")) {
+      r = rispondiSito(req);
     } else {
       r = { status: 404, body: { message: "rotta sconosciuta al finto Normattiva" } };
     }
@@ -122,7 +151,7 @@ const server = http.createServer((req, res) => {
       res.on("close", () => sospese.delete(res));
       return;
     }
-    res.writeHead(r.status, { "content-type": r.raw ? "text/html" : "application/json" });
+    res.writeHead(r.status, { "content-type": r.raw ? "text/html" : "application/json", ...(r.cookie ? { "set-cookie": r.cookie } : {}) });
     res.end(r.raw ?? JSON.stringify(r.body));
   });
 });
@@ -138,7 +167,7 @@ async function avvia(porta, envExtra = {}) {
     command: process.execPath,
     args: ["build/index.js"],
     stderr: "ignore",
-    env: { ...process.env, NORMATTIVA_API_BASE: `http://127.0.0.1:${porta}`, NORMATTIVA_BACKOFF_MS: "5", ...envExtra },
+    env: { ...process.env, NORMATTIVA_API_BASE: `http://127.0.0.1:${porta}`, NORMATTIVA_SITE_BASE: `http://127.0.0.1:${porta}`, NORMATTIVA_BACKOFF_MS: "5", ...envExtra },
   });
   const client = new Client({ name: "test-guasti", version: "1.0.0" });
   await client.connect(transport);
@@ -198,6 +227,115 @@ async function main() {
   r = await chiama({ nome_codice: "codice civile", articolo: 2043, estensione: "bis" });
   verifica("2043-bis inesistente → non trovato, una richiesta",
     r.errore && r.testo.includes("non trovato") && conta(k(CC, 2043, 2, 2)) === 1, `${conta(k(CC, 2043, 2, 2))} chiamate: ${corto(r)}`);
+
+  // --- Articoli decimali (sottoArticolo1: 10 = base, 20 = ".1", 30 = ".2") ------
+
+  imposta(k(CP, 452, 1, 2), artAllegato("452-bis.1", "(Commercio di prodotti inquinanti)."));
+  r = await chiama({ nome_codice: "c.p.", articolo: 452, estensione: "bis", decimale: 1 });
+  verifica("452-bis.1 con decimale=1 → sottoArticolo 2, sottoArticolo1 20, etichetta completa",
+    !r.errore && r.testo.includes("**Art. 452-bis.1**") && r.testo.includes("prodotti inquinanti") &&
+      ultimoCorpo.get(k(CP, 452, 1, 2))?.sottoArticolo1 === 20, corto(r));
+
+  imposta(k(CP, 635, 1, 4), artAllegato("635-quater.1", "(Detenzione, diffusione e installazione abusiva)."));
+  r = await chiama({ nome_codice: "c.p.", articolo: 635, estensione: "quater.1" });
+  verifica("estensione 'quater.1' → decimale 1 (sottoArticolo1 20)",
+    !r.errore && r.testo.includes("**Art. 635-quater.1**") && ultimoCorpo.get(k(CP, 635, 1, 4))?.sottoArticolo1 === 20, corto(r));
+
+  imposta(k(CP, 601, 1, 1), artAllegato("601.1", "(Approfittamento della vittima)."));
+  r = await chiama({ nome_codice: "c.p.", articolo: 601, decimale: 1 });
+  verifica("601.1 senza estensione → sottoArticolo 1, sottoArticolo1 20",
+    !r.errore && r.testo.includes("**Art. 601.1**") && ultimoCorpo.get(k(CP, 601, 1, 1))?.sottoArticolo1 === 20, corto(r));
+
+  r = await chiama({ nome_codice: "c.p.", articolo: 734, decimale: 3 });
+  verifica("decimale inesistente → non trovato, senza la numerazione del c.p. ('e il decimale')",
+    r.errore && r.testo.includes("734.3") && r.testo.includes("e il decimale") && !r.testo.includes("arriva all'art."), corto(r));
+
+  const primaDec = richieste.length;
+  r = await chiama({ nome_codice: "c.p.", decimale: 1 });
+  verifica("decimale senza articolo → errore di parametro, nessuna richiesta",
+    r.errore && r.testo.includes("richiede anche 'articolo'") && richieste.length === primaDec, corto(r));
+
+  r = await chiama({ nome_codice: "c.p.", articolo: 452, estensione: "bis.2", decimale: 1 });
+  verifica("decimale in contraddizione con l'estensione → errore di parametro", r.errore && r.testo.includes("contraddice"), corto(r));
+
+  // --- Data di vigenza: l'API la ignora, il tool lo dichiara ---------------------
+
+  const conVigenza = (n, testo, inizio, fine = "99999999") => {
+    const a = artAllegato(n, testo);
+    return { ...a, body: { ...a.body, data: { atto: { ...a.body.data.atto, articoloDataInizioVigenza: inizio, articoloDataFineVigenza: fine } } } };
+  };
+  imposta(k(CP, 452, 1, 2), conVigenza("452-bis", "(Inquinamento ambientale).", "20260602"));
+  r = await chiama({ nome_codice: "c.p.", articolo: 452, estensione: "bis", data_vigenza: "2010-01-01" });
+  verifica("data_vigenza anteriore alla versione restituita → avviso 'NON RISPETTATA'",
+    !r.errore && r.testo.includes("DATA DI VIGENZA NON RISPETTATA") && r.testo.includes("02/06/2026"), corto(r));
+  r = await chiama({ nome_codice: "c.p.", articolo: 452, estensione: "bis", data_vigenza: "2026-07-01" });
+  verifica("data_vigenza coperta dalla versione → nessun avviso, conferma",
+    !r.errore && !r.testo.includes("NON RISPETTATA") && r.testo.includes("vigente anche alla data richiesta"), corto(r));
+  r = await chiama({ nome_codice: "c.p.", articolo: 452, estensione: "bis" });
+  verifica("senza data_vigenza → solo la data di inizio della versione",
+    !r.errore && r.testo.includes("Versione in vigore dal 02/06/2026") && !r.testo.includes("richiesta"), corto(r));
+
+  // --- Articolo oltre il tetto: parti e note ------------------------------------
+
+  const LUNGO = "TESTL001";
+  const righeArt = Array.from({ length: 300 }, (_, i) => `${i + 1}) disposizione numero ${i + 1} ${"x".repeat(90)}`).join("<br>");
+  const righeNote = Array.from({ length: 200 }, (_, i) => `nota ${i + 1} ${"y".repeat(90)}`).join("<br>");
+  imposta(k(LUNGO, 9, 0), { status: 200, body: { code: null, message: null, success: true, data: { atto: {
+    titolo: "DECRETO LEGISLATIVO DI PROVA", sottoTitolo: "(prova)",
+    articoloHtml: `<div class="bodyTesto"><h2 class="article-num-akn">Art. 9</h2><div class="art-comma-div-akn">${righeArt}</div>` +
+      `<div class="note-akn"> Note all'art. 9: <br>${righeNote}</div></div>`,
+  } } } });
+  const lungo = { codice_redazionale: LUNGO, data_gu: "2026-04-14", articolo: 9 };
+  const r1 = await chiama(lungo);
+  const r2 = await chiama({ ...lungo, parte: 2 });
+  verifica("articolo lungo → parte 1 di 2, entro il tetto, invito a parte=2",
+    !r1.errore && r1.testo.includes("parte 1 di 2") && r1.testo.length <= 40_000 && r1.testo.includes("parte=2") && !r1.testo.includes("TRONCATA"), `${r1.testo.length} car.: ${corto(r1)}`);
+  verifica("taglio all'inizio delle note: parte 1 = articolo intero, parte 2 = note",
+    r1.testo.includes("300) disposizione") && !r1.testo.includes("Note all'art. 9") && r2.testo.includes("Note all'art. 9") && r2.testo.includes("nota 200") && r2.testo.includes("ultima parte"),
+    `${corto(r2)}`);
+  r = await chiama({ ...lungo, note: false });
+  verifica("note=false → una parte sola, note escluse e dichiarate",
+    !r.errore && !r.testo.includes("parte 1") && !r.testo.includes("nota 1 ") && r.testo.includes("300) disposizione") && r.testo.includes("note=false"), corto(r));
+  r = await chiama({ ...lungo, parte: 3 });
+  verifica("parte inesistente → errore chiaro", r.errore && r.testo.includes("ha 2 parti"), corto(r));
+  r = await chiama({ codice_redazionale: LUNGO, data_gu: "2026-04-14", parte: 2 });
+  verifica("parte senza articolo → errore di parametro", r.errore && r.testo.includes("'parte' richiede anche 'articolo'"), corto(r));
+
+  // --- aggiornamenti_articolo (finto sito) ----------------------------------------
+
+  sitoAgg.set(`${CP}|601|1|20`, rigaAgg(1, "01/07/2026", "Il DECRETO LEGISLATIVO 12 giugno 2026, n. 115 (in G.U. 01/07/2026, n.150)",
+    "atto.dataPubblicazioneGazzetta=2026-07-01&amp;atto.codiceRedazionale=26G00130&amp;atto.articolo.numero=1&amp;atto.articolo.sottoArticolo=1&amp;atto.articolo.tipoArticolo=0",
+    "ha disposto (con l'art. 3, comma 1, lettera c)) l'introduzione dell'art. 601.1."));
+  sitoLog.length = 0;
+  r = await chiama({ nome_codice: "c.p.", articolo: 601, decimale: 1 }, "aggiornamenti_articolo");
+  const vedi = sitoLog.find((p) => p.startsWith("/do/")) ?? "";
+  verifica("aggiornamenti 601.1: atto aperto prima della finestra, id del sito corretti",
+    !r.errore && sitoLog[0]?.startsWith("/atto/caricaDettaglioAtto") && /idSottoArticolo=1&art\.idSottoArticolo1=20/.test(vedi) && /flagTipoArticolo=1/.test(vedi),
+    `${JSON.stringify(sitoLog)} ${corto(r)}`);
+  verifica("aggiornamenti 601.1: atto modificativo, data GU e articolo preso dal testo (art. 3, non il link all'art. 1)",
+    r.testo.includes("n. 115") && r.testo.includes("GU 01/07/2026") && r.testo.includes(`codice_redazionale="26G00130", data_gu="2026-07-01", articolo=3)`), corto(r));
+
+  for (const n of [576, 577, 578]) imposta(k(CP, n, 1), artAllegato(n, `testo dell'art. ${n}`));
+  sitoLog.length = 0;
+  r = await chiama({ nome_codice: "c.p.", articolo: 576 }, "aggiornamenti_articolo");
+  verifica("seconda chiamata sullo stesso atto → niente riapertura; zero righe → testo originario",
+    !r.errore && r.testo.includes("testo originario") && !sitoLog.some((p) => p.startsWith("/atto/")), `${JSON.stringify(sitoLog)} ${corto(r)}`);
+
+  sitoAperti.clear(); // il sito dimentica la sessione
+  sitoLog.length = 0;
+  r = await chiama({ nome_codice: "c.p.", articolo: 577 }, "aggiornamenti_articolo");
+  verifica("sessione scaduta → atto riaperto una volta, poi risposta",
+    !r.errore && r.testo.includes("testo originario") && sitoLog.filter((p) => p.startsWith("/atto/")).length === 1 && sitoLog.filter((p) => p.startsWith("/do/")).length === 2,
+    `${JSON.stringify(sitoLog)} ${corto(r)}`);
+
+  sitoLog.length = 0;
+  r = await chiama({ nome_codice: "codice civile", articolo: 9999 }, "aggiornamenti_articolo");
+  verifica("articolo inesistente (API) → non trovato, sito non interrogato", r.errore && r.testo.includes("non trovato") && sitoLog.length === 0, `${JSON.stringify(sitoLog)} ${corto(r)}`);
+
+  sitoRotto = true;
+  r = await chiama({ nome_codice: "c.p.", articolo: 578 }, "aggiornamenti_articolo");
+  sitoRotto = false;
+  verifica("sito con grafica cambiata → errore dichiarato, l'articolo esiste", r.errore && r.testo.includes("struttura cambiata") && r.testo.includes("L'articolo esiste"), corto(r));
 
   // Atto senza numerazione nota, articolo sempre in errore → errore temporaneo. Anche
   // con l'art. 1 in cache (vista di default): il riscontro sull'art. 1 non c'è più.
@@ -291,7 +429,7 @@ async function main() {
   imposta(k(CC, 2044, 2), artAllegato(2044, "Non è responsabile chi cagiona il danno per legittima difesa"));
   r = await chiama({ nome_codice: "codice civile", articolo: 2044, data_vigenza: "1/3/2020" });
   verifica("data_vigenza gg/mm/aaaa convertita in AAAA-MM-GG",
-    !r.errore && ultimoCorpo.get(k(CC, 2044, 2))?.dataVigenza === "2020-03-01" && r.testo.includes("vigenza: 2020-03-01"), `${JSON.stringify(ultimoCorpo.get(k(CC, 2044, 2)))} ${corto(r)}`);
+    !r.errore && ultimoCorpo.get(k(CC, 2044, 2))?.dataVigenza === "2020-03-01" && r.testo.includes("vigenza richiesta: 2020-03-01"), `${JSON.stringify(ultimoCorpo.get(k(CC, 2044, 2)))} ${corto(r)}`);
   r = await chiama({ nome_codice: "codice civile", articolo: 2044, data_vigenza: "2023-02-30" });
   verifica("data impossibile (30 febbraio) rifiutata", r.errore && r.testo.includes("data non valida"), corto(r));
 

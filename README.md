@@ -90,6 +90,7 @@ Claude utilizzerà automaticamente gli strumenti del server MCP per interrogare 
 | Strumento | Descrizione |
 |-----------|-------------|
 | `dettaglio_atto` | Testo di un atto o di un articolo (anche `-bis`/`-ter`); identificabile per `nome_codice`, tipo+numero+anno o codice redazionale |
+| `aggiornamenti_articolo` | Atti che hanno introdotto o modificato un articolo (atto, data GU, disposizione, cosa cambia), dal sito normattiva.it |
 | `corpi_normativi` | Elenco dei codici/testi unici/leggi fondamentali richiamabili con `nome_codice` |
 | `ricerca_semplice` | Ricerca per parole chiave nel titolo e testo |
 | `ricerca_avanzata` | Ricerca con filtri (tipo atto, date, vigenza, ecc.) |
@@ -104,6 +105,11 @@ Claude utilizzerà automaticamente gli strumenti del server MCP per interrogare 
 dettaglio_atto(nome_codice="codice civile", articolo=2043)      → art. 2043 c.c.
 dettaglio_atto(nome_codice="c.p.", articolo=609, estensione="bis") → art. 609-bis c.p.
 dettaglio_atto(nome_codice="cpa", articolo=29)                  → art. 29 c.p.a.
+dettaglio_atto(nome_codice="c.p.", articolo=452, estensione="bis", decimale=1) → art. 452-bis.1 c.p.
+dettaglio_atto(nome_codice="c.p.", articolo=601, decimale=1)    → art. 601.1 c.p.
+dettaglio_atto(nome_codice="231/2001", articolo=25, estensione="octies.2") → art. 25-octies.2 D.Lgs. 231/2001
+dettaglio_atto(tipo_atto="DECRETO LEGISLATIVO", numero=47, anno=2026, articolo=9, parte=2) → seguito di un articolo lungo
+aggiornamenti_articolo(nome_codice="231/2001", articolo=25, estensione="quinquies") → chi ha introdotto la lett. c-bis)
 dettaglio_atto(tipo_atto="DECRETO LEGISLATIVO", numero=152, anno=2006, articolo=192)
 ```
 
@@ -137,6 +143,10 @@ dettaglio_atto(tipo_atto="DECRETO LEGISLATIVO", numero=152, anno=2006, articolo=
 - I log vengono scritti su `stderr` (non interferiscono con il protocollo MCP)
 - `dettaglio_atto` gestisce anche i **testi unici e i codici approvati con decreto** (codice civile, penale, procedura civile/penale, c.p.a., TULPS, legge fallimentare, ecc.): i loro articoli stanno negli **allegati** dell'atto (`flagTipoArticolo` dell'API: 0 = corpo, N = allegato N-esimo) e vengono cercati automaticamente in corpo e allegati 1–3. Il **codice civile** è l'allegato 2 del R.D. 262/1942 (l'allegato 1 sono le preleggi); il **c.p.a.** è l'allegato 2 del D.Lgs. 104/2010.
 - Gli articoli con estensione (`-bis`, `-ter`, … fino a `-vicies`) si recuperano con `articolo=N` + `estensione` (campo `sottoArticolo` dell'API: 2 = bis, 3 = ter, …).
+- Gli **articoli decimali** (452-bis.1, 635-quater.1, 270-quinquies.3, 601.1 c.p.; 25-octies.2 D.Lgs. 231/2001, …) si recuperano con `decimale=N`, oppure con il decimale in coda all'estensione (`estensione="bis.1"`). L'API li individua col campo `sottoArticolo1`, non documentato: 10 = articolo base, 20 = `.1`, 30 = `.2`, … (la stessa numerazione dei link `caricaArticolo` del sito; i valori 1, 2, … danno 404). Verificato contro l'API l'8/11/2026.
+- **La data di vigenza non produce versioni storiche.** `/atto/dettaglio-atto` accetta `dataVigenza` ma la ignora: restituisce sempre la versione attuale (verificato l'8/11/2026: art. 452-bis c.p. chiesto al 2010 → testo in vigore dal 02/06/2026). Il server confronta la data chiesta con il periodo di vigenza dell'articolo restituito (`articoloDataInizioVigenza`/`articoloDataFineVigenza`) e, se non coincide, lo dichiara nella risposta invece di far passare il testo attuale per quello storico.
+- **Articoli più lunghi del tetto di dimensione** (es. art. 9 D.Lgs. 47/2026, ~55.000 caratteri) arrivano **divisi in parti**: la risposta dice «parte 1 di N» e `parte=2`, `3`, … dà il seguito. Il taglio cade preferibilmente all'inizio delle «Note all'art.» della GU, poi a fine riga (comma o lettera). `note=false` esclude quelle note (blocco `note-akn` dell'HTML).
+- **`aggiornamenti_articolo` legge il sito, non l'API.** L'API Open Data non dice quale atto ha modificato un articolo; il sito sì, nella finestra «aggiornamenti all'articolo» (`/do/atto/vediAggiornamentiAllArticolo`). La finestra risponde solo se nella stessa sessione è stato aperto l'atto (`/atto/caricaDettaglioAtto`): il server tiene i cookie e riapre l'atto se la sessione scade. Zero righe valgono sia per un articolo mai modificato sia per uno inesistente, perciò l'esistenza si verifica prima con l'API. Le date sono di pubblicazione in GU dell'atto modificativo; per la decorrenza il tool indica la `dettaglio_atto` da chiamare sulla disposizione. Il numero dell'articolo modificativo si prende dal testo («con l'art. 5»): il link del sito a volte punta all'art. 1. Essendo HTML del sito, un cambio di grafica lo rompe: il tool lo dichiara e lo smoke test settimanale se ne accorge.
 
 ### Limiti di dimensione e di tempo
 
